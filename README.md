@@ -88,7 +88,19 @@ This is a complete VLA training framework. Follow these steps in order:
 
 ```bash
 cd bh-VLA
-pip install -r requirements.txt
+
+# Install uv if not already installed
+pip install uv
+
+# Create virtual environment and install all dependencies
+uv venv && source .venv/bin/activate   # macOS/Linux
+uv venv && .venv\Scripts\activate      # Windows
+
+uv pip install -e .                   # 본 패키지 + deps
+
+# Optional extras (unneeded modules 제거 시 스킵)
+uv pip install -e '.[robot]'           # 로봇 하드웨어 (pyserial, lerobot)
+uv pip install -e '.[rlds]'            # RLDS 데이터셋 포맷
 ```
 
 ### Step 2: (Optional) Set Up Robot Hardware

@@ -1,0 +1,52 @@
+[project]
+name = "bh-vla"
+version = "0.1.0"
+description = "Unified Vision-Language-Action Model Training Framework for SO-101 Robot"
+requires-python = ">=3.10"
+dependencies = [
+    # Core
+    "torch>=2.1.0",
+    "torchvision>=0.16.0",
+    "numpy>=1.24.0",
+
+    # Data / I/O
+    "h5py>=3.10.0",
+    "pillow>=10.0.0",
+    "opencv-python>=4.8.0",
+    "tqdm>=4.65.0",
+    "pyyaml>=6.0",
+    "pyserial>=3.5",
+
+    # Optional: RLDS
+    "tensorflow-datasets>=4.9.0",
+    "tensorflow>=2.13.0",
+
+    # Optional: Visualization
+    "matplotlib>=3.7.0",
+    "wandb>=0.15.0",
+
+    # Optional: LeRobot
+    "lerobot>=0.1.0",
+
+    # Dev
+    "pytest>=7.0",
+    "black>=23.0",
+    "isort>=5.12",
+    "flake8>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "black>=23.0",
+    "isort>=5.12",
+    "flake8>=6.0",
+]
+rlds = [
+    "tensorflow-datasets>=4.9.0",
+    "tensorflow>=2.13.0",
+]
+robot = [
+    "pyserial>=3.5",
+    "lerobot>=0.1.0",
+]
