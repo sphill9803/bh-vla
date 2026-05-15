@@ -128,8 +128,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.episode_refs: List[str] = []
         self.normalization_stats: Dict[str, np.ndarray] = {}
 
-    def __post_init__(self) -> None:
-        """Initialise HDF5 file and compute normalisation statistics."""
         self.load_data()
 
     def load_data(self) -> None:
@@ -240,11 +238,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 images[key] = img_arr
 
         # Load state
-        state_dim = getattr(self.config, 'state_dim', 28)
         if self.config.state_key in episode:
             state = episode[self.config.state_key][t]
         else:
-            state = np.zeros(state_dim, dtype=np.float32)
+            state = np.zeros(28, dtype=np.float32)
 
         # Load language instruction
         if self.config.language_key in episode:
@@ -319,7 +316,6 @@ class RLDSDataset(torch.utils.data.Dataset):
         self.normalization_stats: Dict[str, np.ndarray] = {}
         self._samples_per_record: List[int] = []
 
-    def __post_init__(self) -> None:
         self.load_data()
 
     def load_data(self) -> None:
@@ -482,7 +478,6 @@ class DirectoryDataset(torch.utils.data.Dataset):
         self.normalization_stats: Dict[str, np.ndarray] = {}
         self._episode_lengths: List[int] = []  # Length of each episode
 
-    def __post_init__(self) -> None:
         self.load_data()
 
     def load_data(self) -> None:
@@ -635,7 +630,6 @@ class ALOHADataset(torch.utils.data.Dataset):
         self.normalization_stats: Dict[str, np.ndarray] = {}
         self._episode_lengths: List[int] = []
 
-    def __post_init__(self) -> None:
         self.load_data()
 
     def load_data(self) -> None:

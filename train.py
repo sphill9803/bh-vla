@@ -369,9 +369,9 @@ def train(args: argparse.Namespace) -> None:
         with open(stats_path, "w") as f:
             json.dump(dataset_stats, f, indent=2)
 
-    # Split into train/val
-    train_ds, val_ds = split_dataset(dataset_cls(ds_config, split="train"),
-                                      args.val_split)
+    # Split dataset by index
+    train_ds = dataset_cls(ds_config.data_dir, ds_config, split="train")
+    val_ds = dataset_cls(ds_config.data_dir, ds_config, split="val")
 
     train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True,
                               num_workers=args.num_workers, collate_fn=collate_fn)

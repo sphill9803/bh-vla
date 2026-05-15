@@ -316,6 +316,12 @@ class ACTConfig:
         dropout: Dropout rate for all layers (default 0.1).
         max_instr_len: Maximum instruction length (default 128).
         clip_norm: Gradient clipping norm (default 1.0).
+        lr: Learning rate (default 1e-4).
+        weight_decay: Weight decay for optimizer (default 1e-4).
+        warmup_steps: Warmup steps for LR scheduler (default 1000).
+        gradient_clip: Gradient clipping norm (default 1.0).
+        batch_size: Training batch size (default 32).
+        num_epochs: Number of training epochs (default 100).
     """
 
     num_cameras: int = 3
@@ -332,6 +338,12 @@ class ACTConfig:
     dropout: float = 0.1
     max_instr_len: int = 128
     clip_norm: float = 1.0
+    lr: float = 1e-4
+    weight_decay: float = 1e-4
+    warmup_steps: int = 1000
+    gradient_clip: float = 1.0
+    batch_size: int = 32
+    num_epochs: int = 100
 
 
 class ACTPolicy(nn.Module):

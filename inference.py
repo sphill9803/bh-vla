@@ -77,7 +77,11 @@ def test_inference(args: argparse.Namespace) -> None:
         # Predict action
         with torch.no_grad():
             if args.mode == "act":
-                action = policy.predict_action(synthetic_images, args.language)
+                from policies.act import CharacterTokenizer
+                tokenizer = CharacterTokenizer()
+                token_ids = torch.tensor(tokenizer.encode(args.language), dtype=torch.long).unsqueeze(0).to(device)
+                state = torch.zeros(12, dtype=torch.float32).unsqueeze(0).to(device)
+                action = policy.predict_action(synthetic_images, token_ids, state)
             else:
                 action = policy.predict_action(synthetic_images, args.language)
 
@@ -124,6 +128,7 @@ def robot_inference(args: argparse.Namespace) -> None:
 
     policy.load_checkpoint(args.checkpoint)
     policy = policy.to(args.device)
+    device = torch.device(args.device)
 
     # Initialize robot
     robot_cfg = RobotConfig()
@@ -164,7 +169,14 @@ def robot_inference(args: argparse.Namespace) -> None:
 
             # Predict action
             with torch.no_grad():
-                action = policy.predict_action(images_tensor, args.language, obs["state"])
+                if args.mode == "act":
+                    from policies.act import CharacterTokenizer
+                    tokenizer = CharacterTokenizer()
+                    token_ids = torch.tensor(tokenizer.encode(args.language), dtype=torch.long).unsqueeze(0).to(device)
+                    state_t = torch.tensor(obs["state"], dtype=torch.float32).unsqueeze(0).to(device)
+                    action = policy.predict_action(images_tensor, token_ids, state_t)
+                else:
+                    action = policy.predict_action(images_tensor, args.language)
             action_np = action.cpu().numpy()
 
             # Send to robot

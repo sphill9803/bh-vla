@@ -68,18 +68,10 @@ def validate_config(config: Any, mode: str = "act") -> None:
             raise ValueError("action_chunk_size must be > 0")
         if config.action_dim <= 0:
             raise ValueError("action_dim must be > 0")
-        if config.lr <= 0 or config.lr > 1:
-            raise ValueError(f"lr must be in (0, 1], got {config.lr}")
         if config.num_epochs <= 0:
             raise ValueError("num_epochs must be > 0")
         if config.batch_size <= 0:
             raise ValueError("batch_size must be > 0")
-        if config.transformer_num_layers <= 0:
-            raise ValueError("transformer_num_layers must be > 0")
-        if config.transformer_num_heads <= 0:
-            raise ValueError("transformer_num_heads must be > 0")
-        if config.image_size <= 0:
-            raise ValueError("image_size must be > 0")
     elif mode == "pi05":
         assert isinstance(config, Pi05Config), f"Expected Pi05Config, got {type(config).__name__}"
         if config.action_chunk_size <= 0:
