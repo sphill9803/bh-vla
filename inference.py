@@ -1,203 +1,142 @@
 #!/usr/bin/env python3
 """
-Inference Script: Run the trained VLA policy on real robot hardware.
+bh-VLA Inference Script: Run trained policy on robot or in test mode.
 
 Usage:
-    # Inference with ACT policy
+    # On real robot
     python inference.py --mode act --checkpoint ./checkpoints/act_last.pt
 
-    # Inference with pi0.5 policy
-    python inference.py --mode pi05 --checkpoint ./checkpoints/pi05_last.pt
-
-    # Run in headless mode (no robot, just test forward pass)
+    # Test mode (synthetic data, no robot needed)
     python inference.py --mode act --checkpoint ./checkpoints/act_last.pt --test-mode
 
-    # Run with specific language instruction
+    # pi0.5 inference with custom flow steps
+    python inference.py --mode pi05 --checkpoint ./checkpoints/pi05_last.pt --flow-steps 100
+
+    # With specific language instruction
     python inference.py --mode act --checkpoint ./checkpoints/act_last.pt \
         --language "pick up the red cup"
 """
 
+from __future__ import annotations
+
+import argparse
 import os
 import sys
-import argparse
 import time
 import numpy as np
+import torch
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from policies.act import ACTPolicy, ACTConfig
+from policies.pi05 import Pi05Policy, Pi05Config
+from data.robot_interface import SO101Robot, RobotConfig
+from utils import get_device
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="bh-VLA: Inference Script",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-    # Run on real robot
-    python inference.py --mode act --checkpoint ./checkpoints/act_last.pt
-
-    # Test with synthetic data
-    python inference.py --mode act --checkpoint ./checkpoints/act_last.pt --test-mode
-
-    # Run with custom language instruction
-    python inference.py --mode act --checkpoint ./checkpoints/act_last.pt \\
-        --language "fold the laundry"
-        """
-    )
-
-    parser.add_argument("--mode", type=str, required=True, choices=["act", "pi05"],
-                        help="Policy mode: 'act' or 'pi05'")
-    parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Path to the trained checkpoint file")
-    parser.add_argument("--language", type=str, default="pick up the object",
-                        help="Language instruction for the policy")
-    parser.add_argument("--test-mode", action="store_true",
-                        help="Run in test mode with synthetic data (no robot needed)")
-    parser.add_argument("--num-steps", type=int, default=100,
-                        help="Number of inference steps (in test mode)")
-    parser.add_argument("--device", type=str, default="cuda",
-                        choices=["cuda", "cpu"], help="Device to run inference on")
-    parser.add_argument("--flow-steps", type=int, default=50,
-                        help="Number of flow matching steps (pi0.5 only)")
-
-    args = parser.parse_args()
-
-    print("=" * 60)
-    print(f"  bh-VLA Inference")
-    print(f"  Mode: {args.mode}")
-    print(f"  Checkpoint: {args.checkpoint}")
-    print(f"  Language: {args.language}")
+def test_inference(args: argparse.Namespace) -> None:
+    """Run inference with synthetic data (no robot needed)."""
+    print(f"\n{'='*60}")
+    print(f"  bh-VLA Inference — Test Mode")
+    print(f"  Policy: {args.mode}")
     print(f"  Device: {args.device}")
-    print("=" * 60)
+    print(f"  Checkpoint: {args.checkpoint}")
+    print(f"{'='*60}\n")
 
-    # Verify checkpoint exists
-    if not os.path.exists(args.checkpoint):
-        print(f"Error: Checkpoint not found: {args.checkpoint}")
-        sys.exit(1)
-
-    if args.test_mode:
-        run_test_inference(args)
-    else:
-        run_robot_inference(args)
-
-
-def run_test_inference(args):
-    """Run inference with synthetic data (no robot hardware needed)."""
-    import torch
-    import sys
-
-    # Import the policy
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from train import ACTPolicy, ACTConfig, Pi05Config
-
-    # Create and load the policy
+    # Load model
     if args.mode == "act":
-        policy_config = ACTConfig(
-            image_encoder="resnet18",
-            image_size=224,
-            action_dim=14,
-            action_chunk_size=90,
-        )
+        policy_config = ACTConfig(action_dim=args.action_dim,
+                                   action_chunk_size=args.chunk_size)
         policy = ACTPolicy(policy_config)
         policy.load_checkpoint(args.checkpoint)
     else:
-        policy_config = Pi05Config(
-            flow_steps=args.flow_steps,
-            action_dim=14,
-            action_chunk_size=32,
-        )
+        policy_config = Pi05Config(action_dim=args.action_dim,
+                                    action_chunk_size=args.chunk_size,
+                                    flow_steps=args.flow_steps)
         policy = Pi05Policy(policy_config)
         policy.load_checkpoint(args.checkpoint)
 
-    print(f"\nPolicy loaded: {args.mode}")
-    print(f"  Mode: {args.mode}")
-    print(f"  Action dim: {policy.config.action_dim}")
-    print(f"  Chunk size: {policy.config.action_chunk_size}")
-    print("-" * 60)
+    policy = policy.to(args.device)
+    device = torch.device(args.device)
+    total_params = sum(p.numel() for p in policy.parameters())
+    print(f"Model loaded: {args.mode} ({total_params:,} parameters)\n")
 
     # Run synthetic inference
-    print(f"\nRunning inference for {args.num_steps} steps...")
-    print("(Using synthetic data - no robot hardware required)\n")
-
-    # Create synthetic observation
+    print(f"Running inference for {args.num_steps} steps (synthetic data)...\n")
     num_cameras = 3
     img_size = 224
-    synthetic_images = torch.randn(
-        num_cameras, 3, img_size, img_size,
-        device=args.device
-    )
+    action_history = []
 
     for step in range(args.num_steps):
+        # Synthetic observation
+        synthetic_images = torch.randn(num_cameras, 3, img_size, img_size, device=device)
+
         # Predict action
-        if args.mode == "act":
-            action = policy.predict_action(synthetic_images, args.language)
-        else:
-            action = policy.predict_action(synthetic_images, args.language)
+        with torch.no_grad():
+            if args.mode == "act":
+                action = policy.predict_action(synthetic_images, args.language)
+            else:
+                action = policy.predict_action(synthetic_images, args.language)
 
-        # Print the action
         action_np = action.cpu().numpy()
-        action_str = " ".join([f"{v:.3f}" for v in action_np])
+        action_history.append(action_np)
 
-        # Print every 10 steps for readability
         if step % 10 == 0 or step == args.num_steps - 1:
-            print(f"  Step {step+1:3d}/{args.num_steps}: action = [{action_str}]")
+            print(f"  Step {step+1:4d}/{args.num_steps}: "
+                  f"action = [{', '.join([f'{v:+.4f}' for v in action_np[:5]])}...{len(action_np)-5} more]")
 
-        # Simulate state update
-        state_noise = np.random.randn(len(action_np)) * 0.01
-        synthetic_images = torch.randn(num_cameras, 3, img_size, img_size,
-                                       device=args.device)
-
-        # Small delay to simulate real-time
+        # Small delay
         time.sleep(0.01)
 
-    print("\nInference complete!")
-    print("This was running in test mode with synthetic data.")
-    print("For real robot execution, run without --test-mode.")
+    # Save action history
+    history_dir = os.path.join("./outputs", "inference")
+    os.makedirs(history_dir, exist_ok=True)
+    np.save(os.path.join(history_dir, f"inference_{args.mode}.npy"),
+            np.array(action_history))
+    print(f"\nAction history saved to {os.path.join(history_dir, f'inference_{args.mode}.npy')}")
 
 
-def run_robot_inference(args):
-    """Run inference on real robot hardware."""
-    import torch
-    import sys
-    import numpy as np
+def robot_inference(args: argparse.Namespace) -> None:
+    """Run inference on real SO-101 robot hardware."""
+    print(f"\n{'='*60}")
+    print(f"  bh-VLA Inference — Robot Mode")
+    print(f"  Policy: {args.mode}")
+    print(f"  Checkpoint: {args.checkpoint}")
+    print(f"  Language: {args.language}")
+    print(f"{'='*60}\n")
 
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from train import ACTPolicy, ACTConfig, Pi05Config, RobotConfig
-
-    # Create and load the policy
+    # Load model
     if args.mode == "act":
-        policy_config = ACTConfig(
-            image_encoder="resnet18",
-            image_size=224,
-            action_dim=14,
-            action_chunk_size=90,
-        )
+        policy_config = ACTConfig(action_dim=args.action_dim,
+                                   action_chunk_size=args.chunk_size)
         policy = ACTPolicy(policy_config)
     else:
-        policy_config = Pi05Config(
-            flow_steps=args.flow_steps,
-            action_dim=14,
-            action_chunk_size=32,
-        )
+        policy_config = Pi05Config(action_dim=args.action_dim,
+                                    action_chunk_size=args.chunk_size,
+                                    flow_steps=args.flow_steps)
         policy = Pi05Policy(policy_config)
 
     policy.load_checkpoint(args.checkpoint)
     policy = policy.to(args.device)
 
     # Initialize robot
-    robot_config = RobotConfig()
-    robot = RobotInterface(robot_config)
+    robot_cfg = RobotConfig()
+    robot = SO101Robot(robot_cfg)
 
-    print("\nInitializing robot hardware...")
+    print("Connecting to robot hardware...")
     try:
         robot.connect()
     except Exception as e:
-        print(f"Warning: Robot connection failed: {e}")
+        print(f"Error connecting to robot: {e}")
         print("Falling back to test mode...")
-        run_test_inference(args)
+        test_inference(args)
         return
 
-    print("\n" + "=" * 60)
-    print("  Starting inference loop at 50Hz")
-    print("  Press Ctrl+C to stop")
-    print("=" * 60)
+    print(f"\n{'='*60}")
+    print(f"  Starting inference loop at ~50Hz")
+    print(f"  Language instruction: {args.language}")
+    print(f"  Press Ctrl+C to stop")
+    print(f"{'='*60}\n")
 
     step = 0
     action_history = []
@@ -218,22 +157,19 @@ def run_robot_inference(args):
             images_tensor = (images_tensor - 0.5) / 0.5  # Normalize
 
             # Predict action
-            action = policy.predict_action(images_tensor, args.language, obs["state"])
+            with torch.no_grad():
+                action = policy.predict_action(images_tensor, args.language, obs["state"])
             action_np = action.cpu().numpy()
 
-            # Send action to robot
+            # Send to robot
             robot.send_action(action_np)
-
-            # Track action history
             action_history.append(action_np)
-
-            # Log
             step += 1
-            if step % 20 == 0:
-                print(f"  Step {step}: action = [{', '.join([f'{v:.3f}' for v in action_np])}]")
 
-            # Maintain 50Hz frequency
-            time.sleep(0.015)  # ~66Hz target
+            if step % 20 == 0:
+                print(f"  Step {step}: action = [{', '.join([f'{v:+.4f}' for v in action_np[:5]])}...{len(action_np)-5} more]")
+
+            time.sleep(0.015)
 
     except KeyboardInterrupt:
         print(f"\nStopped after {step} steps.")
@@ -242,10 +178,63 @@ def run_robot_inference(args):
 
     # Save action history
     if action_history:
-        history_path = "./outputs/action_history.npy"
-        os.makedirs(os.path.dirname(history_path), exist_ok=True)
-        np.save(history_path, np.array(action_history))
-        print(f"Action history saved to {history_path}")
+        history_dir = os.path.join("./outputs", "inference")
+        os.makedirs(history_dir, exist_ok=True)
+        np.save(os.path.join(history_dir, f"inference_{args.mode}_robot.npy"),
+                np.array(action_history))
+        print(f"\nAction history saved to {os.path.join(history_dir, f'inference_{args.mode}_robot.npy')}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="bh-VLA: Inference Script",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # On real robot
+    python inference.py --mode act --checkpoint ./checkpoints/act_last.pt
+
+    # Test mode (no robot needed)
+    python inference.py --mode act --checkpoint ./checkpoints/act_last.pt --test-mode
+
+    # pi0.5 with custom flow steps
+    python inference.py --mode pi05 --checkpoint ./checkpoints/pi05_last.pt --flow-steps 100
+        """
+    )
+
+    parser.add_argument("--mode", type=str, required=True,
+                        choices=["act", "pi05"])
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Path to trained checkpoint (.pt)")
+    parser.add_argument("--language", type=str, default="pick up the object",
+                        help="Language instruction")
+    parser.add_argument("--test-mode", action="store_true",
+                        help="Run with synthetic data (no robot)")
+    parser.add_argument("--num-steps", type=int, default=100,
+                        help="Number of inference steps (test mode)")
+    parser.add_argument("--device", type=str, default="cuda",
+                        choices=["cuda", "cpu"])
+    parser.add_argument("--flow-steps", type=int, default=50,
+                        help="Flow matching steps (pi0.5 only)")
+    parser.add_argument("--chunk-size", type=int, default=None,
+                        help="Override action chunk size")
+    parser.add_argument("--action-dim", type=int, default=14,
+                        help="Action dimension")
+
+    args = parser.parse_args()
+
+    if args.chunk_size:
+        if args.mode == "act":
+            from policies.act import ACTConfig
+            ACTConfig.action_chunk_size = args.chunk_size
+        else:
+            from policies.pi05 import Pi05Config
+            Pi05Config.action_chunk_size = args.chunk_size
+
+    if args.test_mode:
+        test_inference(args)
+    else:
+        robot_inference(args)
 
 
 if __name__ == "__main__":

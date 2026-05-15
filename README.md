@@ -35,7 +35,7 @@
 ### Two Policies, One Codebase
 
 | Policy | Paper | Architecture | Best For |
-|--------|-------|-------------|----------|
+|--------|-------|--------------|----------|
 | **ACT** | [arXiv:2304.13705](https://arxiv.org/abs/2304.13705) | Transformer decoder, predicts action chunks | Quick training, specific tasks |
 | **pi0.5** | [arXiv:2504.16054](https://arxiv.org/abs/2504.16054) | PaliGemma 3B backbone + flow matching | Open-world generalization |
 
@@ -45,6 +45,7 @@
 - **pi0.5** is more powerful. It can generalize to new tasks and environments, but requires more compute.
 
 You can switch between them with a single flag:
+
 ```bash
 python train.py --mode act      # Use ACT
 python train.py --mode pi05     # Use pi0.5
@@ -56,20 +57,23 @@ python train.py --mode pi05     # Use pi0.5
 
 ### 1. ACT (Action Chunking Transformers)
 **Paper:** ["Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware"](https://arxiv.org/abs/2304.13705)
+
 - **Authors:** Tony Z. Zhao et al.
-- **Key idea:** Predict a chunk of N future actions at once (instead of one at a time) to reduce error accumulation
+- **Key insight:** Predict a chunk of N future actions at once (instead of one at a time) to reduce error accumulation
 - **Robot:** ALOHA (6-DOF bimanual arms)
 - **Architecture:** ResNet image encoder → Transformer decoder → Action prediction head
 
 ### 2. pi0.5 (Physical Intelligence)
 **Paper:** ["pi0.5: A Vision-Language-Action Model with Open-World Generalization"](https://arxiv.org/abs/2504.16054)
+
 - **Authors:** Physical Intelligence team
-- **Key idea:** Use a large Vision-Language Model (PaliGemma 3B) as backbone with flow matching for action prediction
+- **Key insight:** Use a large Vision-Language Model (PaliGemma 3B) as backbone with flow matching for action prediction
 - **Generalization:** Can clean kitchens/bedrooms in entirely new homes
 - **Architecture:** PaliGemma VLM → Action expert → Flow matching
 
 ### 3. SO-101 Robot Hardware
 **Reference:** [LeRobot SO-101 Documentation](https://huggingface.co/docs/lerobot/so101)
+
 - **Robot:** SO-101 (by The Robot Studio)
 - **Components:** 6-DOF leader arm + 6-DOF follower arm + 3 cameras + Feetech STS3215 servos
 - **Teleoperation:** Human operator moves the leader arm, follower arm mirrors movements
@@ -81,13 +85,16 @@ python train.py --mode pi05     # Use pi0.5
 This is a complete VLA training framework. Follow these steps in order:
 
 ### Step 1: Install Dependencies
+
 ```bash
 cd bh-VLA
 pip install -r requirements.txt
 ```
 
 ### Step 2: (Optional) Set Up Robot Hardware
+
 If you have an SO-101 robot:
+
 ```bash
 # Install LeRobot (for robot communication)
 pip install lerobot
@@ -101,11 +108,13 @@ lerobot-setup-motors --teleop.type=so101_leader --teleop.port=/dev/ttyACM1
 ```
 
 ### Step 3: Collect Training Data
+
 ```bash
 python collect_data.py --mode act --num-episodes 5
 ```
 
 ### Step 4: Train Your Policy
+
 ```bash
 # Train ACT
 python train.py --mode act
@@ -115,6 +124,7 @@ python train.py --mode pi05
 ```
 
 ### Step 5: Run Inference
+
 ```bash
 # On real robot
 python inference.py --mode act --checkpoint ./checkpoints/act_last.pt
@@ -229,6 +239,7 @@ pip install -r requirements.txt
 ### 2. (Optional) Install Robot Libraries
 
 If you have SO-101 hardware:
+
 ```bash
 pip install lerobot
 pip install lerobot[feetech]
@@ -259,6 +270,7 @@ python collect_data.py --mode pi05 --num-episodes 20 --task-name "fold_clothes"
 ```
 
 **What happens during data collection:**
+
 1. You specify the task (e.g., "pick up the red cup")
 2. You move the leader arm to demonstrate the task
 3. The follower arm mirrors your movements
@@ -266,6 +278,7 @@ python collect_data.py --mode pi05 --num-episodes 20 --task-name "fold_clothes"
 5. Data is saved as numpy arrays in `data/{task_name}/episode_{NNNN}/`
 
 **Data format per episode:**
+
 ```
 data/{task_name}/episode_0000/
 ├── images.npy       # Shape: (frames, H, W, C)
@@ -299,6 +312,7 @@ python train.py --mode act --resume
 ```
 
 **Training output:**
+
 ```
 ============================================================
   bh-VLA Training Framework
@@ -344,6 +358,7 @@ python inference.py --mode pi05 --checkpoint ./checkpoints/pi05_last.pt \
 ```
 
 **What happens during inference:**
+
 1. Policy loads the checkpoint
 2. Robot connects (cameras + motors)
 3. For each step (~50Hz):
@@ -400,25 +415,34 @@ python inference.py --mode pi05 --checkpoint ./checkpoints/pi05_last.pt \
 
 ```
 bh-VLA/
-├── train.py                 # Main training script (all model code + training loop)
+├── train.py                 # Main training script (AMP, early stopping, tqdm)
 ├── inference.py             # Inference script (real robot + test mode)
 ├── collect_data.py          # Teleoperation data collection script
 ├── __init__.py              # Package initialization
 ├── requirements.txt         # Python dependencies
 ├── README.md                # This file
+├── policies/
+│   ├── __init__.py          # Package exports
+│   ├── act.py               # ACT policy (ResNet + Transformer, 923 lines)
+│   ├── pi05.py              # pi0.5 policy (SigLIP + LLaMA + Flow, 1379 lines)
+│   └── config.py            # ACTConfig, Pi05Config, PolicyFactory
+├── data/
+│   ├── __init__.py          # Package exports
+│   ├── dataset.py           # LeRobot/RLDS/Directory/ALOHA datasets
+│   ├── transforms.py        # Transforms + augmentation pipeline
+│   └── robot_interface.py   # SO-101 + Feetech servo interface
 ├── checkpoints/             # Saved model checkpoints (auto-created)
-│   ├── act_last.pt          # Final ACT checkpoint
-│   ├── act_epoch_10.pt      # Intermediate ACT checkpoints
-│   ├── pi05_last.pt         # Final pi0.5 checkpoint
-│   └── pi05_epoch_10.pt     # Intermediate pi0.5 checkpoints
+│   ├── act_last.pt
+│   ├── act_best.pt
+│   ├── pi05_last.pt
+│   └── pi05_best.pt
 ├── data/                    # Collected training data (auto-created)
-│   └── {task_name}/         # Task-specific data directory
-│       ├── episode_0000/    # Per-episode folder
-│       │   ├── images.npy   # (frames, H, W, C) uint8 images
-│       │   ├── states.npy   # (frames, 28) joint positions
-│       │   ├── actions.npy  # (frames, 28) robot actions
-│       │   └── metadata.json
-│       └── ...
+│   └── {task_name}/
+│       └── episode_0000/
+│           ├── images.npy
+│           ├── states.npy
+│           ├── actions.npy
+│           └── metadata.json
 ├── outputs/                 # Training outputs (auto-created)
 │   ├── action_history.npy   # Inference action history
 │   └── logs/                # Training logs
@@ -430,13 +454,17 @@ bh-VLA/
 ## Troubleshooting
 
 ### Problem: "ModuleNotFoundError: No module named 'torch'"
+
 **Solution:** Install PyTorch
+
 ```bash
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 ```
 
 ### Problem: "Robot not connected!"
+
 **Solution:** Check USB connections
+
 ```bash
 # List USB devices
 ls /dev/ttyACM*
@@ -447,13 +475,17 @@ sudo chmod 666 /dev/ttyACM1
 ```
 
 ### Problem: "CUDA out of memory"
+
 **Solution:** Reduce batch size or use CPU
+
 ```bash
 python train.py --mode pi05 --batch-size 4 --device cpu
 ```
 
 ### Problem: "Camera not found"
+
 **Solution:** Check camera connection
+
 ```bash
 # List video devices
 ls /dev/video*
@@ -463,7 +495,9 @@ python -c "import cv2; cap = cv2.VideoCapture(0); print(cap.isOpened())"
 ```
 
 ### Problem: "Motor communication failed"
+
 **Solution:** Verify motor IDs and baudrates
+
 ```bash
 # Reset motor configuration
 lerobot-setup-motors --robot.type=so101_follower --robot.port=/dev/ttyACM0
