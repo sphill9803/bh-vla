@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# bh-VLA specific
+checkpoints/
+data/picked_and_place/
+data/fold_clothes/
+outputs/
+logs/
+*.pt
+*.npy
+data/*/dataset_info.json
+data/*/dataset_stats.json

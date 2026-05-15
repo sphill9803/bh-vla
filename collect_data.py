@@ -100,7 +100,7 @@ Examples:
             robot = None
 
     # Collect data
-    collected_episodes = collect_data(args, robot)
+    collected_episodes = collect_data(args, robot, data_dir)
 
     # Summary
     print(f"\n{'='*60}")
@@ -129,7 +129,7 @@ Examples:
     print(f"  3. Run inference: python inference.py --mode {args.mode}")
 
 
-def collect_data(args: argparse.Namespace, robot) -> list:
+def collect_data(args: argparse.Namespace, robot, data_dir: str) -> list:
     """Main data collection loop."""
     collected_episodes = []
 

@@ -282,6 +282,7 @@ class SigLIPPatchEmbeddings(nn.Module):
         self.patch_size = patch_size
         self.num_patches = (img_size // patch_size) ** 2
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -297,9 +298,10 @@ class SigLIPPatchEmbeddings(nn.Module):
         x = self.proj(x)                                    # (B, embed, H/P, W/P)
         x = x.flatten(2).transpose(1, 2)                    # (B, NP, embed)
 
-        # CLS token
-        cls_token = nn.Parameter(torch.zeros(1, 1, x.shape[-1]))
-        x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)  # (B, NP+1, embed)
+        # CLS token (moved to nn.Parameter above)
+        B = x.size(0)
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)  # (B, 1+NP+1, D)
         return x
 
 
@@ -412,15 +414,9 @@ class SigLIPVisionEncoder(nn.Module):
             cls_token: (B, embed_dim)   — CLS embedding after all transformer layers
             patch_features: (B, NP, embed_dim) — patch embeddings after all transformer layers
         """
-        # Patch embedding + CLS
+        # Patch embedding already prepends CLS inside patch_embed.forward()
         x = self.patch_embed(x)                                    # (B, NP+1, D)
         x = x + self.pos_embed                                     # positional encoding
-
-        # Prepend learned CLS token (already inside patch_embed via cls_token param)
-        B = x.size(0)
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls_tokens, x], dim=1)                      # (B, 1+NP+1, D)
-        x = x[:, :self.num_tokens]                                 # clamp if needed
 
         # Transformer layers
         for layer in self.layers:

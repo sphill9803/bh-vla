@@ -427,6 +427,7 @@ def train(args: argparse.Namespace) -> None:
 
     # 6. Training loop
     best_val_loss = float("inf")
+    train_state.best_val_loss = best_val_loss
     epoch = train_state.epoch
     progress = ProgressTracker(config.num_epochs, label="epoch")
 
@@ -449,6 +450,7 @@ def train(args: argparse.Namespace) -> None:
         # Checkpoint if best
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            train_state.best_val_loss = best_val_loss  # Keep in sync
             ckpt_path = os.path.join(args.checkpoint_dir, f"{args.mode}_best.pt")
             save_checkpoint(policy, optimizer, scheduler, epoch + 1,
                             train_state.to_dict(), ckpt_path, args.mode)
@@ -479,6 +481,7 @@ def train(args: argparse.Namespace) -> None:
             train_state.patience_counter += 1
         else:
             train_state.best_val_loss = val_loss
+            best_val_loss = val_loss  # Keep in sync
             train_state.patience_counter = 0
 
         if train_state.patience_counter >= args.patience:

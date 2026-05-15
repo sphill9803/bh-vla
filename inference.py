@@ -43,16 +43,19 @@ def test_inference(args: argparse.Namespace) -> None:
     print(f"  Checkpoint: {args.checkpoint}")
     print(f"{'='*60}\n")
 
-    # Load model
+    # Load model with overrides
+    overrides = {}
+    if args.chunk_size:
+        overrides["action_chunk_size"] = args.chunk_size
+    if args.action_dim:
+        overrides["action_dim"] = args.action_dim
+
     if args.mode == "act":
-        policy_config = ACTConfig(action_dim=args.action_dim,
-                                   action_chunk_size=args.chunk_size)
+        policy_config = ACTConfig(**overrides)
         policy = ACTPolicy(policy_config)
         policy.load_checkpoint(args.checkpoint)
     else:
-        policy_config = Pi05Config(action_dim=args.action_dim,
-                                    action_chunk_size=args.chunk_size,
-                                    flow_steps=args.flow_steps)
+        policy_config = Pi05Config(**overrides, flow_steps=args.flow_steps)
         policy = Pi05Policy(policy_config)
         policy.load_checkpoint(args.checkpoint)
 
@@ -105,15 +108,18 @@ def robot_inference(args: argparse.Namespace) -> None:
     print(f"  Language: {args.language}")
     print(f"{'='*60}\n")
 
-    # Load model
+    # Load model with overrides
+    overrides = {}
+    if args.chunk_size:
+        overrides["action_chunk_size"] = args.chunk_size
+    if args.action_dim:
+        overrides["action_dim"] = args.action_dim
+
     if args.mode == "act":
-        policy_config = ACTConfig(action_dim=args.action_dim,
-                                   action_chunk_size=args.chunk_size)
+        policy_config = ACTConfig(**overrides)
         policy = ACTPolicy(policy_config)
     else:
-        policy_config = Pi05Config(action_dim=args.action_dim,
-                                    action_chunk_size=args.chunk_size,
-                                    flow_steps=args.flow_steps)
+        policy_config = Pi05Config(**overrides, flow_steps=args.flow_steps)
         policy = Pi05Policy(policy_config)
 
     policy.load_checkpoint(args.checkpoint)
@@ -218,18 +224,10 @@ Examples:
                         help="Flow matching steps (pi0.5 only)")
     parser.add_argument("--chunk-size", type=int, default=None,
                         help="Override action chunk size")
-    parser.add_argument("--action-dim", type=int, default=14,
-                        help="Action dimension")
+    parser.add_argument("--action-dim", type=int, default=None,
+                        help="Action dimension (overrides default)")
 
     args = parser.parse_args()
-
-    if args.chunk_size:
-        if args.mode == "act":
-            from policies.act import ACTConfig
-            ACTConfig.action_chunk_size = args.chunk_size
-        else:
-            from policies.pi05 import Pi05Config
-            Pi05Config.action_chunk_size = args.chunk_size
 
     if args.test_mode:
         test_inference(args)
