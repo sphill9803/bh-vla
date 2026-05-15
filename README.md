@@ -128,12 +128,26 @@ python collect_data.py --mode act --num-episodes 5
 ### Step 4: Train Your Policy
 
 ```bash
-# Train ACT
+# Train ACT (single GPU)
 python train.py --mode act
 
-# Train pi0.5
+# Train pi0.5 (single GPU)
 python train.py --mode pi05
+
+# Train pi0.5 — **multi-GPU recommended** ⚡ (pi0.5는 GPU 2개 이상 권장)
+accelerate launch train.py --mode pi05 --use-accelerate
+
+# Multi-GPU 4개 GPU + gradient accumulation 4
+accelerate launch --num_processes=4 train.py --mode pi05 --use-accelerate --gradient-accumulation 4
 ```
+
+**GPU 추천 사양:**
+| Policy | 최소 GPU | 권장 GPU |
+|--------|----------|----------|
+| ACT | RTX 3060 12GB | RTX 3060 12GB |
+| pi0.5 | RTX 4090 24GB | 2× RTX 4090 / A100 80GB |
+
+*pi0.5는 큰 모델(PaliGemma 3B backbone)이라 멀티 GPU 없이는 VRAM이 부족할 수 있어요.*
 
 ### Step 5: Run Inference
 
