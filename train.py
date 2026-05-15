@@ -9,7 +9,7 @@ Complete training script supporting two VLA policies:
 Both policies can be trained and evaluated through this unified interface.
 
 Usage:
-    # Train ACT policy
+    # Train ACT policy (single GPU)
     python train.py --mode act
 
     # Train pi0.5 policy
@@ -23,6 +23,12 @@ Usage:
 
     # Train with a YAML config file
     python train.py --config config.yaml
+
+    # Multi-GPU training (accelerate auto-detects GPUs)
+    accelerate launch train.py --mode act --use-accelerate
+
+    # Multi-GPU with gradient accumulation
+    accelerate launch train.py --mode act --use-accelerate --gradient-accumulation 4
 """
 
 from __future__ import annotations
@@ -40,14 +46,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import DataLoader, DistributedSampler
+from tqdm import tqdm
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from policies.config import PolicyFactory, validate_config, save_config_json, config_to_dict
-from policies.act import ACTConfig, ACTPolicy
+from policies.act import ACTConfig, ACTPolicy, ACTLoss
 from policies.pi05 import Pi05Config, Pi05Policy
 from data.dataset import (
     LeRobotDataset,
@@ -57,7 +63,6 @@ from data.dataset import (
     DatasetConfig,
     collate_fn,
     compute_dataset_stats,
-    split_dataset,
 )
 from data.transforms import get_train_transforms, get_val_transforms
 from utils import (
@@ -79,19 +84,64 @@ from utils import (
 
 
 # =====================================================================
+# Accelerate Setup
+# =====================================================================
+
+def setup_accelerate(args: argparse.Namespace):
+    """Initialize accelerate settings if --use-accelerate is specified.
+
+    Returns:
+        (accelerator, model, optimizer, lr_scheduler, train_loader, val_loader) or
+        (None, model, optimizer, lr_scheduler, train_loader, val_loader)
+    """
+    if not getattr(args, "use_accelerate", False):
+        return None, None, None, None, None, None
+
+    try:
+        from accelerate import Accelerator
+    except ImportError:
+        raise ImportError("accelerate is required for --use-accelerate. "
+                          "Install with: pip install accelerate")
+
+    deepspeed_config = {}
+    if getattr(args, "deepspeed_config", None):
+        with open(args.deepspeed_config, "r") as f:
+            import yaml
+            deepspeed_config = yaml.safe_load(f)
+
+    # Gradient accumulation
+    accumulation_steps = getattr(args, "gradient_accumulation", 1)
+
+    # Mixed precision: auto-select best dtype for this hardware
+    mixed_precision = "no"
+    if torch.cuda.is_available():
+        if torch.cuda.is_bf16_supported():
+            mixed_precision = "bf16"
+        else:
+            mixed_precision = "fp16"
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=accumulation_steps,
+        mixed_precision=mixed_precision,
+        deepspeed_plugin=deepspeed_config if deepspeed_config else None,
+    )
+
+    logging.info(f"Accelerator configured: {accelerator}")
+    logging.info(f"  Device: {accelerator.device}")
+    logging.info(f"  Mixed precision: {accelerator.mixed_precision}")
+    logging.info(f"  Gradient accumulation: {accumulation_steps}")
+    logging.info(f"  Number of processes: {accelerator.num_processes}")
+    logging.info(f"  Gradient bits: {accelerator.scaler.loss_scale}")
+
+    return accelerator
+
+
+# =====================================================================
 # Training State
 # =====================================================================
 
 class TrainingState:
-    """Track training progress for checkpointing and resuming.
-
-    Attributes:
-        epoch: Current epoch (0-indexed).
-        best_val_loss: Best validation loss seen so far.
-        best_epoch: Epoch when best_val_loss occurred.
-        patience_counter: Early stopping counter.
-        metrics: Dict of per-epoch metrics.
-    """
+    """Track training progress for checkpointing and resuming."""
 
     def __init__(self, best_val_loss: float = float("inf"), best_epoch: int = -1):
         self.epoch = 0
@@ -134,80 +184,92 @@ def train_one_epoch(
     grad_clip: float = 1.0,
     use_amp: bool = True,
     logger: Optional[logging.Logger] = None,
+    accelerator: Optional[Any] = None,
 ) -> Dict[str, float]:
-    """Train for one epoch.
-
-    Args:
-        model: Policy model.
-        train_loader: Training data loader.
-        optimizer: Optimizer.
-        scheduler: LR scheduler.
-        loss_fn: Loss function.
-        device: Device.
-        mode: 'act' or 'pi05'.
-        grad_clip: Gradient clipping norm.
-        use_amp: Whether to use automatic mixed precision.
-        logger: Optional logger.
-
-    Returns:
-        Dict with 'train_loss' key.
-    """
+    """Train for one epoch."""
     model.train()
     epoch_loss = 0.0
     batch_count = 0
 
-    scaler = GradScaler(enabled=use_amp and torch.cuda.is_available())
+    if accelerator is not None:
+        train_loader = accelerator.prepare(train_loader)
 
     for batch in train_loader:
-        # Move data to device
-        images = batch["images"].to(device, non_blocking=True)  # (B, C, H, W)
-        actions_gt = batch["actions"].to(device, non_blocking=True)  # (B, chunk, dim)
-        states = batch["state"].to(device, non_blocking=True)  # (B, state_dim)
-        language = batch["language"]  # list of strings
+        images = batch["images"].to(device, non_blocking=True)
+        actions_gt = batch["actions"].to(device, non_blocking=True)
+        states = batch["state"].to(device, non_blocking=True)
+        language = batch["language"]
 
         optimizer.zero_grad()
 
-        if use_amp and torch.cuda.is_available():
-            with autocast():
-                if mode == "act":
-                    actions_pred = model(images, language[0], states)
-                    loss = loss_fn(actions_pred, actions_gt)
-                elif mode == "pi05":
-                    text_ids = batch.get("language_ids",
-                                         torch.zeros(actions_gt.size(0), 64, dtype=torch.long, device=device))
-                    loss = model.compute_flow_matching_loss(images, text_ids, actions_gt)
-                else:
-                    raise ValueError(f"Unknown mode: {mode}")
-                loss = loss.to(torch.float32)
-
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
+        if accelerator is not None:
+            # accelerator.prepare() handles AMP, DDP, etc. automatically
             if mode == "act":
                 actions_pred = model(images, language[0], states)
                 loss = loss_fn(actions_pred, actions_gt)
             elif mode == "pi05":
                 text_ids = batch.get("language_ids",
-                                     torch.zeros(actions_gt.size(0), 64, dtype=torch.long, device=device))
+                                     torch.zeros(actions_gt.size(0), 64,
+                                                 dtype=torch.long, device=device))
                 loss = model.compute_flow_matching_loss(images, text_ids, actions_gt)
             else:
                 raise ValueError(f"Unknown mode: {mode}")
+            loss = loss.to(torch.float32)
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+            accelerator.backward(loss)
+            if grad_clip > 0:
+                accelerator.clip_grad_norm_(model.parameters(), grad_clip)
+        else:
+            # Standard AMP path
+            if use_amp and torch.cuda.is_available():
+                from torch.cuda.amp import GradScaler, autocast
+                scaler = GradScaler(enabled=True)
+                with autocast():
+                    if mode == "act":
+                        actions_pred = model(images, language[0], states)
+                        loss = loss_fn(actions_pred, actions_gt)
+                    elif mode == "pi05":
+                        text_ids = batch.get("language_ids",
+                                             torch.zeros(actions_gt.size(0), 64,
+                                                         dtype=torch.long, device=device))
+                        loss = model.compute_flow_matching_loss(images, text_ids, actions_gt)
+                    else:
+                        raise ValueError(f"Unknown mode: {mode}")
+                    loss = loss.to(torch.float32)
 
-        epoch_loss += loss.item()
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                if mode == "act":
+                    actions_pred = model(images, language[0], states)
+                    loss = loss_fn(actions_pred, actions_gt)
+                elif mode == "pi05":
+                    text_ids = batch.get("language_ids",
+                                         torch.zeros(actions_gt.size(0), 64,
+                                                     dtype=torch.long, device=device))
+                    loss = model.compute_flow_matching_loss(images, text_ids, actions_gt)
+                else:
+                    raise ValueError(f"Unknown mode: {mode}")
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
+
+        if accelerator is not None:
+            epoch_loss += accelerator.gather(loss.detach().unsqueeze(0)).mean().item()
+        else:
+            epoch_loss += loss.item()
         batch_count += 1
 
-    avg_loss = epoch_loss / max(batch_count, 1)
-    if scheduler is not None:
+    if scheduler is not None and accelerator is None:
+        scheduler.step()
+    elif scheduler is not None and accelerator is not None:
         scheduler.step()
 
-    return {"train_loss": avg_loss}
+    return {"train_loss": epoch_loss / max(batch_count, 1)}
 
 
 def evaluate(
@@ -216,24 +278,15 @@ def evaluate(
     device: torch.device,
     mode: str,
     use_amp: bool = True,
+    accelerator: Optional[Any] = None,
 ) -> Dict[str, float]:
-    """Evaluate model on validation set.
-
-    Args:
-        model: Policy model.
-        val_loader: Validation data loader.
-        device: Device.
-        mode: 'act' or 'pi05'.
-        use_amp: Whether to use AMP.
-
-    Returns:
-        Dict with 'val_loss' key.
-    """
+    """Evaluate model on validation set."""
     model.eval()
     epoch_loss = 0.0
     batch_count = 0
 
-    scaler = GradScaler(enabled=use_amp and torch.cuda.is_available())
+    if accelerator is not None:
+        val_loader = accelerator.prepare(val_loader)
 
     with torch.no_grad():
         for batch in val_loader:
@@ -242,30 +295,47 @@ def evaluate(
             states = batch["state"].to(device, non_blocking=True)
             language = batch["language"]
 
-            if use_amp and torch.cuda.is_available():
-                with autocast():
-                    if mode == "act":
-                        actions_pred = model(images, language[0], states)
-                        loss = F.mse_loss(actions_pred, actions_gt)
-                    elif mode == "pi05":
-                        text_ids = batch.get("language_ids",
-                                             torch.zeros(actions_gt.size(0), 64, dtype=torch.long, device=device))
-                        loss = model.compute_flow_matching_loss(images, text_ids, actions_gt)
-                    else:
-                        raise ValueError(f"Unknown mode: {mode}")
-                    loss = loss.to(torch.float32)
-            else:
+            if accelerator is not None:
                 if mode == "act":
                     actions_pred = model(images, language[0], states)
                     loss = F.mse_loss(actions_pred, actions_gt)
                 elif mode == "pi05":
                     text_ids = batch.get("language_ids",
-                                         torch.zeros(actions_gt.size(0), 64, dtype=torch.long, device=device))
+                                         torch.zeros(actions_gt.size(0), 64,
+                                                     dtype=torch.long, device=device))
                     loss = model.compute_flow_matching_loss(images, text_ids, actions_gt)
                 else:
                     raise ValueError(f"Unknown mode: {mode}")
+                loss = loss.to(torch.float32)
+                epoch_loss += accelerator.gather(loss.detach().unsqueeze(0)).mean().item()
+            else:
+                if use_amp and torch.cuda.is_available():
+                    from torch.cuda.amp import autocast
+                    with autocast():
+                        if mode == "act":
+                            actions_pred = model(images, language[0], states)
+                            loss = F.mse_loss(actions_pred, actions_gt)
+                        elif mode == "pi05":
+                            text_ids = batch.get("language_ids",
+                                                 torch.zeros(actions_gt.size(0), 64,
+                                                             dtype=torch.long, device=device))
+                            loss = model.compute_flow_matching_loss(images, text_ids, actions_gt)
+                        else:
+                            raise ValueError(f"Unknown mode: {mode}")
+                        loss = loss.to(torch.float32)
+                else:
+                    if mode == "act":
+                        actions_pred = model(images, language[0], states)
+                        loss = F.mse_loss(actions_pred, actions_gt)
+                    elif mode == "pi05":
+                        text_ids = batch.get("language_ids",
+                                             torch.zeros(actions_gt.size(0), 64,
+                                                         dtype=torch.long, device=device))
+                        loss = model.compute_flow_matching_loss(images, text_ids, actions_gt)
+                    else:
+                        raise ValueError(f"Unknown mode: {mode}")
 
-            epoch_loss += loss.item()
+                epoch_loss += loss.item()
             batch_count += 1
 
     return {"val_loss": epoch_loss / max(batch_count, 1)}
@@ -276,21 +346,13 @@ def evaluate(
 # =====================================================================
 
 def train(args: argparse.Namespace) -> None:
-    """Main training function.
+    """Main training function."""
+    # 0. Accelerate setup (must come first for multi-GPU)
+    accelerator = setup_accelerate(args)
 
-    Handles:
-        1. Setup (seeds, logging, directories)
-        2. Config loading/validation
-        3. Policy creation via PolicyFactory
-        4. Dataset loading + splitting
-        5. Training loop with tqdm progress
-        6. Periodic evaluation + checkpoint saving
-        7. Early stopping
-        8. Final checkpoint
-    """
     # 1. Setup
+    device = accelerator.device if accelerator is not None else get_device(args.device)
     seed_everything(args.seed)
-    device = get_device(args.device)
     ensure_dir(args.output_dir)
     ensure_dir(args.checkpoint_dir)
     ensure_dir(args.log_dir)
@@ -300,7 +362,11 @@ def train(args: argparse.Namespace) -> None:
 
     # 2. Config loading
     if args.config:
-        config, loaded_mode = load_config_yaml(args.config) if args.config.endswith(".yaml") else load_config_json(args.config)
+        from policies.config import load_config_yaml, load_config_json
+        if args.config.endswith((".yaml", ".yml")):
+            config, loaded_mode = load_config_yaml(args.config)
+        else:
+            config, loaded_mode = load_config_json(args.config)
         if loaded_mode != args.mode:
             logger.warning(f"Config mode {loaded_mode} differs from --mode {args.mode}. Using --mode.")
         if args.lr:
@@ -324,7 +390,7 @@ def train(args: argparse.Namespace) -> None:
             )
         validate_config(config, args.mode)
 
-    # 3. Create policy via PolicyFactory
+    # 3. Create policy
     factory = PolicyFactory()
     policy = factory.create(args.mode)
 
@@ -332,6 +398,7 @@ def train(args: argparse.Namespace) -> None:
     trainable_params = count_trainable_parameters(policy)
     logger.info(f"Total parameters: {format_parameters(total_params)}")
     logger.info(f"Trainable parameters: {format_parameters(trainable_params)}")
+
     policy = policy.to(device)
 
     # 4. Dataset loading
@@ -345,7 +412,6 @@ def train(args: argparse.Namespace) -> None:
     elif args.data_format == "aloha":
         dataset_cls = ALOHADataset
     else:
-        # Auto-detect
         if os.path.exists(os.path.join(ds_config.data_dir, "dataset_infos.json")):
             dataset_cls = LeRobotDataset
         elif os.path.exists(os.path.join(ds_config.data_dir, "data.json")):
@@ -353,7 +419,7 @@ def train(args: argparse.Namespace) -> None:
         else:
             dataset_cls = ALOHADataset
 
-    # Load dataset statistics if available
+    # Dataset stats
     dataset_stats = None
     stats_path = os.path.join(args.data_dir or "./data", "dataset_stats.json")
     if os.path.exists(stats_path):
@@ -361,7 +427,6 @@ def train(args: argparse.Namespace) -> None:
             dataset_stats = json.load(f)
         logger.info(f"Loaded dataset stats from {stats_path}")
 
-    # Compute dataset stats if not provided
     if dataset_stats is None:
         logger.info("Computing dataset statistics...")
         dataset_stats = compute_dataset_stats(ds_config.data_dir)
@@ -373,33 +438,46 @@ def train(args: argparse.Namespace) -> None:
     train_ds = dataset_cls(ds_config.data_dir, ds_config, split="train")
     val_ds = dataset_cls(ds_config.data_dir, ds_config, split="val")
 
-    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True,
-                              num_workers=args.num_workers, collate_fn=collate_fn)
-    val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False,
-                            num_workers=args.num_workers, collate_fn=collate_fn)
+    # DDP / distributed sampler
+    if accelerator is not None and accelerator.num_processes > 1:
+        train_sampler = DistributedSampler(train_ds, shuffle=True,
+                                           seed=args.seed, drop_last=False)
+        val_sampler = DistributedSampler(val_ds, shuffle=False,
+                                         seed=args.seed, drop_last=False)
+        train_loader = DataLoader(train_ds, batch_size=config.batch_size,
+                                  sampler=train_sampler,
+                                  num_workers=args.num_workers,
+                                  collate_fn=collate_fn,
+                                  pin_memory=True)
+        val_loader = DataLoader(val_ds, batch_size=config.batch_size,
+                                sampler=val_sampler,
+                                num_workers=args.num_workers,
+                                collate_fn=collate_fn,
+                                pin_memory=True)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True,
+                                  num_workers=args.num_workers, collate_fn=collate_fn)
+        val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False,
+                                num_workers=args.num_workers, collate_fn=collate_fn)
 
-    logger.info(f"Training samples: {len(train_ds)}")
-    logger.info(f"Validation samples: {len(val_ds)}")
+    # Prepare model/optimizer/ scheduler with accelerator
+    if accelerator is not None:
+        optimizer = torch.optim.AdamW(
+            policy.parameters(),
+            lr=config.lr,
+            weight_decay=config.weight_decay or 1e-4,
+        )
+        policy, optimizer, train_loader, val_loader = accelerator.prepare(
+            policy, optimizer, train_loader, val_loader
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            policy.parameters(),
+            lr=config.lr,
+            weight_decay=config.weight_decay or 1e-4,
+        )
 
-    # 5. Training setup
-    train_state = TrainingState()
-
-    if args.resume:
-        ckpt_path = find_latest_checkpoint(args.checkpoint_dir)
-        if ckpt_path:
-            extra_state = resume_checkpoint(ckpt_path, policy, optimizer, scheduler, device)
-            train_state = TrainingState.from_dict(extra_state.get("training_state", {}))
-        else:
-            logger.info("No checkpoint found. Starting fresh.")
-
-    # Optimizer
-    optimizer = torch.optim.AdamW(
-        policy.parameters(),
-        lr=config.lr,
-        weight_decay=config.weight_decay or 1e-4,
-    )
-
-    # Scheduler: warmup + cosine
+    # Scheduler
     warmup_steps = config.warmup_steps or 1000
     total_steps = len(train_loader) * config.num_epochs
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
@@ -417,87 +495,148 @@ def train(args: argparse.Namespace) -> None:
     # Loss function
     loss_fn = ACTLoss() if args.mode == "act" else None
 
-    # Training progress bar
+    # Training progress
     logger.info(f"\n{'='*60}")
     logger.info(f"  Training {args.mode.upper()} policy")
     logger.info(f"  Epochs: {config.num_epochs} | Batch size: {config.batch_size}")
     logger.info(f"  LR: {config.lr:.2e} | Grad clip: {config.gradient_clip}")
+    if accelerator is not None:
+        logger.info(f"  Multi-GPU: {accelerator.num_processes} GPUs")
+        logger.info(f"  Mixed precision: {accelerator.mixed_precision}")
+        logger.info(f"  Gradient accumulation: {getattr(args, 'gradient_accumulation', 1)}")
     logger.info(f"  Early stopping patience: {args.patience} epochs")
     logger.info(f"{'='*60}\n")
 
-    # 6. Training loop
+    # Training loop
+    train_state = TrainingState()
+
+    if args.resume and accelerator is not None:
+        ckpt_path = find_latest_checkpoint(args.checkpoint_dir)
+        if ckpt_path:
+            logger.info(f"Resuming from {ckpt_path}")
+            # accelerate loads checkpoints differently
+            accelerator.load_state(ckpt_path)
+            # Extract training state from checkpoint
+            state_dict = torch.load(ckpt_path, map_location=device, weights_only=False)
+            if "training_state" in state_dict:
+                train_state = TrainingState.from_dict(state_dict["training_state"])
+            logger.info(f"Resumed from epoch {train_state.epoch}")
+    elif args.resume and accelerator is None:
+        ckpt_path = find_latest_checkpoint(args.checkpoint_dir)
+        if ckpt_path:
+            extra_state = resume_checkpoint(ckpt_path, policy, optimizer, scheduler, device)
+            train_state = TrainingState.from_dict(extra_state.get("training_state", {}))
+        else:
+            logger.info("No checkpoint found. Starting fresh.")
+    else:
+        logger.info("Starting fresh training.")
+
     best_val_loss = float("inf")
     train_state.best_val_loss = best_val_loss
     epoch = train_state.epoch
     progress = ProgressTracker(config.num_epochs, label="epoch")
 
     for epoch in range(train_state.epoch, config.num_epochs):
+        if accelerator is not None and hasattr(train_loader, 'sampler'):
+            train_loader.sampler.set_epoch(epoch)
+
         epoch_start = time.time()
+
         train_metrics = train_one_epoch(
             model=policy, train_loader=train_loader, optimizer=optimizer,
             scheduler=scheduler, loss_fn=loss_fn, device=device,
             mode=args.mode, grad_clip=config.gradient_clip,
             use_amp=args.amp, logger=logger,
+            accelerator=accelerator,
         )
 
-        # Validation
         val_metrics = evaluate(
             model=policy, val_loader=val_loader, device=device,
             mode=args.mode, use_amp=args.amp,
+            accelerator=accelerator,
         )
         val_loss = val_metrics["val_loss"]
 
-        # Checkpoint if best
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            train_state.best_val_loss = best_val_loss  # Keep in sync
-            ckpt_path = os.path.join(args.checkpoint_dir, f"{args.mode}_best.pt")
-            save_checkpoint(policy, optimizer, scheduler, epoch + 1,
-                            train_state.to_dict(), ckpt_path, args.mode)
-            logger.info(f"  New best val_loss: {val_loss:.6f} (checkpoint saved)")
+        # Sync loss across GPUs
+        if accelerator is not None:
+            val_loss = float(accelerator.gather(
+                torch.tensor(val_loss, device=device)
+            ).mean().item())
 
-        # Progress tracking
-        elapsed = time.time() - epoch_start
-        progress.update(
-            train_loss=train_metrics["train_loss"],
-            val_loss=val_loss,
-            lr=scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else scheduler.get_lr()[0],
-        )
-        progress.display(epoch + 1)
+        if accelerator.is_main_process:
+            # Only main process saves checkpoints
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                train_state.best_val_loss = best_val_loss
+                ckpt_path = os.path.join(args.checkpoint_dir, f"{args.mode}_best.pt")
+                save_checkpoint(policy, optimizer, scheduler, epoch + 1,
+                                train_state.to_dict(), ckpt_path, args.mode)
+                logger.info(f"  New best val_loss: {val_loss:.6f} (checkpoint saved)")
 
-        # Save latest checkpoint
-        if (epoch + 1) % args.save_interval == 0 or epoch + 1 == config.num_epochs:
-            ckpt_path = os.path.join(args.checkpoint_dir, f"{args.mode}_epoch_{epoch+1}.pt")
-            save_checkpoint(policy, optimizer, scheduler, epoch + 1,
-                            train_state.to_dict(), ckpt_path, args.mode)
+            elapsed = time.time() - epoch_start
+            progress.update(
+                train_loss=train_metrics["train_loss"],
+                val_loss=val_loss,
+                lr=scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr')
+                   else scheduler.get_lr()[0],
+            )
+            progress.display(epoch + 1)
 
-        # Save config
-        config_path = os.path.join(args.output_dir, f"{args.mode}_config.json")
-        if epoch == train_state.epoch:
-            save_config_json(config, config_path, args.mode)
+            if (epoch + 1) % args.save_interval == 0 or epoch + 1 == config.num_epochs:
+                ckpt_path = os.path.join(args.checkpoint_dir,
+                                         f"{args.mode}_epoch_{epoch+1}.pt")
+                save_checkpoint(policy, optimizer, scheduler, epoch + 1,
+                                train_state.to_dict(), ckpt_path, args.mode)
 
-        # Early stopping
-        if val_loss > train_state.best_val_loss * 1.02:
-            train_state.patience_counter += 1
-        else:
-            train_state.best_val_loss = val_loss
-            best_val_loss = val_loss  # Keep in sync
-            train_state.patience_counter = 0
+            config_path = os.path.join(args.output_dir, f"{args.mode}_config.json")
+            if epoch == train_state.epoch:
+                save_config_json(config, config_path, args.mode)
 
-        if train_state.patience_counter >= args.patience:
-            logger.info(f"Early stopping at epoch {epoch+1}. Best val_loss: {best_val_loss:.6f}")
-            break
+            if val_loss > train_state.best_val_loss * 1.02:
+                train_state.patience_counter += 1
+            else:
+                train_state.best_val_loss = val_loss
+                best_val_loss = val_loss
+                train_state.patience_counter = 0
 
-    # 7. Save final checkpoint
-    final_ckpt = os.path.join(args.checkpoint_dir, f"{args.mode}_last.pt")
-    save_checkpoint(policy, optimizer, scheduler, epoch + 1,
-                    train_state.to_dict(), final_ckpt, args.mode)
+            if train_state.patience_counter >= args.patience:
+                logger.info(f"Early stopping at epoch {epoch+1}. "
+                            f"Best val_loss: {best_val_loss:.6f}")
+                break
 
-    logger.info(f"\n{'='*60}")
-    logger.info(f"  Training complete!")
-    logger.info(f"  Best val_loss: {best_val_loss:.6f} (epoch {train_state.best_epoch+1})")
-    logger.info(f"  Total time: {time.time()-epoch_start:.0f}s")
-    logger.info(f"{'='*60}")
+        # Gather metrics from all processes in DDP
+        if accelerator is not None:
+            gather_metrics = {
+                "train_loss": torch.tensor(train_metrics["train_loss"], device=device),
+                "val_loss": torch.tensor(val_loss, device=device),
+            }
+            gathered = accelerator.gather(gather_metrics)
+            if logger:
+                logger.info(f"Epoch {epoch+1}: "
+                            f"train_loss={gathered['train_loss'].mean().item():.6f} "
+                            f"val_loss={gathered['val_loss'].mean().item():.6f}")
+
+    # Final checkpoint
+    if accelerator is not None:
+        # unwrap model for saving
+        unwrapped = accelerator.unwrap_model(policy)
+        save_path = os.path.join(args.checkpoint_dir, f"{args.mode}_last.pt")
+        accelerator.save(unwrapped.state_dict(), save_path)
+    else:
+        final_ckpt = os.path.join(args.checkpoint_dir, f"{args.mode}_last.pt")
+        save_checkpoint(policy, optimizer, scheduler, epoch + 1,
+                        train_state.to_dict(), final_ckpt, args.mode)
+
+    if accelerator.is_main_process:
+        logger.info(f"\n{'='*60}")
+        logger.info(f"  Training complete!")
+        logger.info(f"  Best val_loss: {best_val_loss:.6f} "
+                    f"(epoch {train_state.best_epoch+1})")
+        logger.info(f"  Total time: {time.time()-epoch_start:.0f}s")
+        logger.info(f"{'='*60}")
+
+    if accelerator is not None:
+        accelerator.end_training()
 
 
 # =====================================================================
@@ -511,10 +650,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Train ACT policy
+    # Train ACT policy (single GPU)
     python train.py --mode act
 
-    # Train pi0.5 policy with custom settings
+    # Train pi0.5 with custom settings
     python train.py --mode pi05 --lr 1e-5 --batch-size 8 --epochs 30
 
     # Resume from latest checkpoint
@@ -528,6 +667,12 @@ Examples:
 
     # Reduce early stopping patience
     python train.py --mode pi05 --patience 5
+
+    # ===== Multi-GPU training with accelerate =====
+    accelerate launch train.py --mode act --use-accelerate
+    accelerate launch --num_processes=4 train.py --mode act --use-accelerate
+    accelerate launch train.py --mode act --use-accelerate \
+        --gradient-accumulation 4  # accumulate 4 batches per step
         """
     )
 
@@ -572,6 +717,14 @@ Examples:
                         help="Use automatic mixed precision")
     parser.add_argument("--gradient-clip", type=float, default=1.0,
                         help="Gradient clipping norm")
+
+    # ===== Accelerate options =====
+    parser.add_argument("--use-accelerate", action="store_true",
+                        help="Enable multi-GPU training via accelerate")
+    parser.add_argument("--gradient-accumulation", type=int, default=1,
+                        help="Number of gradient accumulation steps (with --use-accelerate)")
+    parser.add_argument("--deepspeed-config", type=str, default=None,
+                        help="DeepSpeed config file path (with --use-accelerate)")
 
     args = parser.parse_args()
     train(args)

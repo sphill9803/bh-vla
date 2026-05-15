@@ -4,9 +4,10 @@ version = "0.1.0"
 description = "Unified Vision-Language-Action Model Training Framework for SO-101 Robot"
 requires-python = ">=3.10"
 dependencies = [
-    # Core
+    # Core ML / Deep Learning
     "torch>=2.1.0",
     "torchvision>=0.16.0",
+    "accelerate>=0.28.0",
     "numpy>=1.24.0",
 
     # Data / I/O
