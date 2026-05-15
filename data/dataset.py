@@ -240,10 +240,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 images[key] = img_arr
 
         # Load state
+        state_dim = getattr(self.config, 'state_dim', 28)
         if self.config.state_key in episode:
             state = episode[self.config.state_key][t]
         else:
-            state = np.zeros(self.config.state_dim if hasattr(self.config, 'state_dim') else 28, dtype=np.float32)
+            state = np.zeros(state_dim, dtype=np.float32)
 
         # Load language instruction
         if self.config.language_key in episode:
@@ -738,14 +739,17 @@ class ALOHADataset(torch.utils.data.Dataset):
             if "left_action_mean" in self.normalization_stats:
                 # ALOHA-specific: normalise left and right arms separately
                 actions = np.array(actions, dtype=np.float32)
+                # Ensure actions is 1D (N, action_dim) -> if loaded as (1, 28) slice to first row
+                if actions.ndim == 2 and actions.shape[0] == 1:
+                    actions = actions[0]
                 # Left arm (joints 0-6)
                 for j in range(7):
                     if self.normalization_stats["left_action_std"][j] > 0:
-                        actions[:7, j] = (actions[:7, j] - self.normalization_stats["left_action_mean"][j]) / self.normalization_stats["left_action_std"][j]
+                        actions[j] = (actions[j] - self.normalization_stats["left_action_mean"][j]) / self.normalization_stats["left_action_std"][j]
                 # Right arm (joints 7-13)
                 for j in range(7):
                     if self.normalization_stats["right_action_std"][j] > 0:
-                        actions[7:, j] = (actions[7:, j] - self.normalization_stats["right_action_mean"][j]) / self.normalization_stats["right_action_std"][j]
+                        actions[7 + j] = (actions[7 + j] - self.normalization_stats["right_action_mean"][j]) / self.normalization_stats["right_action_std"][j]
             else:
                 # Fallback: global normalisation
                 mean = self.normalization_stats.get("action_mean", np.zeros(28))

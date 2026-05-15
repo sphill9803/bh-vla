@@ -810,9 +810,10 @@ class SO101Robot:
                 # Get observation
                 obs = self.get_observation()
 
-                # Extract frames
-                for cam_name, frame in obs["images"].items():
-                    all_frames.append(frame)
+                # Extract frame from the first (main) camera only
+                main_cam = next(iter(obs["images"].values()), None)
+                if main_cam is not None:
+                    all_frames.append(main_cam)
 
                 # Record state and action (teleop: action = follower state)
                 all_states.append(obs["state"].copy())

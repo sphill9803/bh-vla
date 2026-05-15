@@ -205,6 +205,8 @@ class ColorJitter(ImageTransform):
                 gray = arr.mean(dim=0, keepdim=True)
                 factor = 1 + random.uniform(-self.saturation, self.saturation)
                 arr = (arr - gray) * factor + gray
+                factor = 1 + random.uniform(-self.saturation, self.saturation)
+                arr = (arr - gray) * factor + gray
             return torch.clamp(arr, 0, 1)
 
         return image
