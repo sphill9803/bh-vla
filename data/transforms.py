@@ -27,7 +27,7 @@ from PIL import Image
 # Image Transforms
 # ====================================================================
 
-class ImageTransform:
+class ImageTransform(nn.Module):
     """Base class for image transforms.
 
     All image transforms should subclass this and implement ``__call__``.
@@ -38,6 +38,7 @@ class ImageTransform:
     """
 
     def __init__(self, to_tensor: bool = False):
+        super().__init__()
         self.to_tensor = to_tensor
 
     def __call__(self, image: Any) -> Any:
@@ -106,7 +107,7 @@ class RandomCrop(ImageTransform):
         elif isinstance(image, Image.Image):
             w, h = image.size
             th, tw = self.size
-            if h > th:
+            if h >= th and w >= tw:
                 left = random.randint(0, w - tw) if self.training else (w - tw) // 2
                 top = random.randint(0, h - th) if self.training else (h - th) // 2
                 image = image.crop((left, top, left + tw, top + th))
@@ -203,8 +204,6 @@ class ColorJitter(ImageTransform):
                 arr = (arr - mean) * factor + mean
             if self.saturation > 0 and arr.size(0) >= 3:
                 gray = arr.mean(dim=0, keepdim=True)
-                factor = 1 + random.uniform(-self.saturation, self.saturation)
-                arr = (arr - gray) * factor + gray
                 factor = 1 + random.uniform(-self.saturation, self.saturation)
                 arr = (arr - gray) * factor + gray
             return torch.clamp(arr, 0, 1)

@@ -29,7 +29,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from policies.act import ACTPolicy, ACTConfig
-from policies.pi05 import Pi05Policy, Pi05Config
+from policies.pi05 import Pi05Policy, Pi05Config, Pi05DataPreprocessor
 from data.robot_interface import SO101Robot, RobotConfig
 from utils import get_device
 
@@ -52,12 +52,10 @@ def test_inference(args: argparse.Namespace) -> None:
 
     if args.mode == "act":
         policy_config = ACTConfig(**overrides)
-        policy = ACTPolicy(policy_config)
-        policy.load_checkpoint(args.checkpoint)
+        policy = ACTPolicy.load_checkpoint(args.checkpoint, device=args.device, config=policy_config)
     else:
         policy_config = Pi05Config(**overrides, flow_steps=args.flow_steps)
-        policy = Pi05Policy(policy_config)
-        policy.load_checkpoint(args.checkpoint)
+        policy = Pi05Policy.load_checkpoint(args.checkpoint, device=args.device, config=policy_config)
 
     policy = policy.to(args.device)
     device = torch.device(args.device)
@@ -67,7 +65,7 @@ def test_inference(args: argparse.Namespace) -> None:
     # Run synthetic inference
     print(f"Running inference for {args.num_steps} steps (synthetic data)...\n")
     num_cameras = 3
-    img_size = 224
+    img_size = policy.config.image_size[0] if args.mode == "act" else policy.config.image_size
     action_history = []
 
     for step in range(args.num_steps):
@@ -80,10 +78,19 @@ def test_inference(args: argparse.Namespace) -> None:
                 from policies.act import CharacterTokenizer
                 tokenizer = CharacterTokenizer()
                 token_ids = torch.tensor(tokenizer.encode(args.language), dtype=torch.long).unsqueeze(0).to(device)
-                state = torch.zeros(12, dtype=torch.float32).unsqueeze(0).to(device)
+                state = torch.zeros(policy.config.state_dim, dtype=torch.float32).unsqueeze(0).to(device)
                 action = policy.predict_action(synthetic_images, token_ids, state)
             else:
-                action = policy.predict_action(synthetic_images, args.language)
+                token_ids = torch.tensor(
+                    Pi05DataPreprocessor.tokenize_text(
+                        args.language,
+                        max_len=policy.config.text_max_len,
+                        vocab_size=policy.config.text_vocab_size,
+                    ),
+                    dtype=torch.long,
+                    device=device,
+                )
+                action = policy.predict_action(synthetic_images, token_ids, num_steps=args.flow_steps)
 
         action_np = action.cpu().numpy()
         action_history.append(action_np)
@@ -121,12 +128,10 @@ def robot_inference(args: argparse.Namespace) -> None:
 
     if args.mode == "act":
         policy_config = ACTConfig(**overrides)
-        policy = ACTPolicy(policy_config)
+        policy = ACTPolicy.load_checkpoint(args.checkpoint, device=args.device, config=policy_config)
     else:
         policy_config = Pi05Config(**overrides, flow_steps=args.flow_steps)
-        policy = Pi05Policy(policy_config)
-
-    policy.load_checkpoint(args.checkpoint)
+        policy = Pi05Policy.load_checkpoint(args.checkpoint, device=args.device, config=policy_config)
     policy = policy.to(args.device)
     device = torch.device(args.device)
 
@@ -164,8 +169,15 @@ def robot_inference(args: argparse.Namespace) -> None:
             ], axis=0)
 
             # Convert to tensor
-            images_tensor = torch.tensor(images, dtype=torch.float32).to(args.device)
-            images_tensor = (images_tensor - 0.5) / 0.5  # Normalize
+            images_tensor = torch.tensor(images, dtype=torch.float32).permute(0, 3, 1, 2).to(args.device)
+            if args.mode == "act":
+                images_tensor = images_tensor / 255.0
+                mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, device=device).view(1, 3, 1, 1)
+                std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, device=device).view(1, 3, 1, 1)
+                images_tensor = (images_tensor - mean) / std
+            else:
+                images_tensor = images_tensor / 255.0
+                images_tensor = (images_tensor - 0.5) / 0.5
 
             # Predict action
             with torch.no_grad():
@@ -176,7 +188,16 @@ def robot_inference(args: argparse.Namespace) -> None:
                     state_t = torch.tensor(obs["state"], dtype=torch.float32).unsqueeze(0).to(device)
                     action = policy.predict_action(images_tensor, token_ids, state_t)
                 else:
-                    action = policy.predict_action(images_tensor, args.language)
+                    token_ids = torch.tensor(
+                        Pi05DataPreprocessor.tokenize_text(
+                            args.language,
+                            max_len=policy.config.text_max_len,
+                            vocab_size=policy.config.text_vocab_size,
+                        ),
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    action = policy.predict_action(images_tensor, token_ids, num_steps=args.flow_steps)
             action_np = action.cpu().numpy()
 
             # Send to robot

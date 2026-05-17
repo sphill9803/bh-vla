@@ -15,6 +15,7 @@ Provides:
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import math
 import os
@@ -25,6 +26,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.utils.data
+from PIL import Image
 
 
 # ====================================================================
@@ -61,6 +63,11 @@ class DatasetConfig:
     normalize_observations: bool = True
     max_dataset_size: int = -1
     image_size: int = 224
+    num_cameras: int = 3
+    action_chunk_size: int = 32
+    action_dim: int = 14
+    state_dim: int = 28
+    mode: str = "act"
     train_split: float = 0.8
     val_split: float = 0.1
     test_split: float = 0.1
@@ -75,6 +82,210 @@ class DatasetConfig:
             self.val_split / total,
             self.test_split / total,
         ]
+
+
+def _split_items(items: List[str], config: DatasetConfig, split: str) -> List[str]:
+    """Deterministically split episode paths into train/val/test partitions."""
+    rng = random.Random(config.seed)
+    shuffled = items.copy()
+    rng.shuffle(shuffled)
+
+    n = len(shuffled)
+    train_ratio, val_ratio, _ = config._split_ratios
+    train_end = int(n * train_ratio)
+    val_end = train_end + int(n * val_ratio)
+
+    if split == "train":
+        return shuffled[:train_end] or shuffled[:1]
+    if split == "val":
+        return shuffled[train_end:val_end] or shuffled[:1]
+    if split == "test":
+        return shuffled[val_end:] or shuffled[-1:]
+    return shuffled
+
+
+def _pad_or_trim_vector(values: Any, target_dim: int) -> np.ndarray:
+    """Return a 1D float32 vector with exactly ``target_dim`` elements."""
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    if target_dim <= 0:
+        return arr
+    if arr.size >= target_dim:
+        return arr[:target_dim]
+    out = np.zeros(target_dim, dtype=np.float32)
+    out[:arr.size] = arr
+    return out
+
+
+def _slice_state(states: Any, timestep: int, state_dim: int) -> np.ndarray:
+    """Pick the current robot state at ``timestep`` and make it model-sized."""
+    arr = np.asarray(states, dtype=np.float32)
+    if arr.ndim <= 1:
+        return _pad_or_trim_vector(arr, state_dim)
+    t = min(max(timestep, 0), arr.shape[0] - 1)
+    return _pad_or_trim_vector(arr[t], state_dim)
+
+
+def _slice_action_chunk(
+    actions: Any,
+    start: int,
+    chunk_size: int,
+    action_dim: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return a fixed-size future action chunk and a True=ignore padding mask."""
+    arr = np.asarray(actions, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    if arr.size == 0:
+        arr = np.zeros((1, action_dim), dtype=np.float32)
+
+    start = min(max(start, 0), max(arr.shape[0] - 1, 0))
+    chunk = arr[start:start + chunk_size]
+
+    valid = chunk.shape[0]
+    if valid == 0:
+        chunk = np.zeros((1, arr.shape[-1]), dtype=np.float32)
+        valid = 1
+
+    if valid < chunk_size:
+        pad_value = chunk[-1:]
+        pad = np.repeat(pad_value, chunk_size - valid, axis=0)
+        chunk = np.concatenate([chunk, pad], axis=0)
+
+    if action_dim > 0:
+        fixed = np.zeros((chunk_size, action_dim), dtype=np.float32)
+        dim = min(action_dim, chunk.shape[1])
+        fixed[:, :dim] = chunk[:, :dim]
+        chunk = fixed
+
+    ignore_mask = np.ones(chunk_size, dtype=bool)
+    ignore_mask[:valid] = False
+    return chunk.astype(np.float32), ignore_mask
+
+
+def _ensure_rgb_image(image: Any, image_size: int) -> np.ndarray:
+    """Convert an image-like object to HWC uint8 RGB with a fixed square size."""
+    arr = np.asarray(image)
+    if arr.ndim == 2:
+        arr = np.stack([arr] * 3, axis=-1)
+    if arr.ndim == 3 and arr.shape[0] == 3 and arr.shape[-1] != 3:
+        arr = np.transpose(arr, (1, 2, 0))
+    if arr.ndim != 3:
+        arr = np.zeros((image_size, image_size, 3), dtype=np.uint8)
+    if arr.shape[-1] == 4:
+        arr = arr[..., :3]
+    if arr.shape[-1] == 1:
+        arr = np.repeat(arr, 3, axis=-1)
+    arr = arr.astype(np.uint8) if arr.dtype != np.uint8 else arr
+    if arr.shape[0] != image_size or arr.shape[1] != image_size:
+        arr = np.asarray(Image.fromarray(arr).resize((image_size, image_size), Image.BILINEAR))
+    return arr
+
+
+def _load_image_array(path: str, timestep: int) -> Optional[np.ndarray]:
+    """Load either a whole episode image array or a per-timestep image array."""
+    if not os.path.exists(path):
+        return None
+    arr = np.load(path)
+    if arr.ndim >= 4:
+        t = min(max(timestep, 0), arr.shape[0] - 1)
+        return arr[t]
+    return arr
+
+
+def _load_episode_images(
+    ep_dir: str,
+    timestep: int,
+    keys: Sequence[str],
+    image_size: int,
+) -> Dict[str, np.ndarray]:
+    """Load multi-camera images, supporting both nested and simple layouts."""
+    images: Dict[str, np.ndarray] = {}
+
+    root_images = _load_image_array(os.path.join(ep_dir, "images.npy"), timestep)
+    for idx, key in enumerate(keys):
+        candidates = [
+            os.path.join(ep_dir, "images", f"{key}.npy"),
+            os.path.join(ep_dir, f"{key}.npy"),
+        ]
+        image = None
+        for path in candidates:
+            image = _load_image_array(path, timestep)
+            if image is not None:
+                break
+
+        # The simple collector saves a single camera as images.npy. Duplicate it
+        # across expected camera slots so the policy still receives N cameras.
+        if image is None and root_images is not None:
+            image = root_images
+
+        if image is None:
+            image = np.zeros((image_size, image_size, 3), dtype=np.uint8)
+        images[key] = _ensure_rgb_image(image, image_size)
+
+    return images
+
+
+def _normalise_image_tensor(images: torch.Tensor, mode: str) -> torch.Tensor:
+    """Normalize stacked images for ACT (ImageNet) or pi0.5 (SigLIP-style)."""
+    images = images.float() / 255.0
+    if mode == "pi05":
+        mean = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32).view(1, 3, 1, 1)
+        std = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32).view(1, 3, 1, 1)
+    else:
+        mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
+    return (images - mean) / std
+
+
+def _image_dict_to_tensor(images: Dict[str, Any], num_cameras: int, image_size: int, mode: str) -> torch.Tensor:
+    """Convert a camera dict to (num_cameras, 3, H, W)."""
+    ordered = list(images.values())
+    if not ordered:
+        ordered = [np.zeros((image_size, image_size, 3), dtype=np.uint8)]
+    while len(ordered) < num_cameras:
+        ordered.append(ordered[-1])
+    ordered = ordered[:num_cameras]
+
+    tensors = []
+    for image in ordered:
+        arr = _ensure_rgb_image(image, image_size)
+        tensors.append(torch.from_numpy(arr).permute(2, 0, 1))
+    return _normalise_image_tensor(torch.stack(tensors, dim=0), mode)
+
+
+def _tokenize_act(text: str, max_len: int = 128) -> torch.Tensor:
+    """Character tokenizer matching the lightweight ACT language encoder."""
+    chars = (
+        "0123456789"
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        " .,!?;:'\"-()[]{}|/\\@#$%^&*~`"
+        "\t\n"
+    )
+    vocab = ["<pad>", "<unk>", "<sos>", "<eos>"] + list(chars)
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [2]
+    ids.extend(table.get(ch, 1) for ch in text.lower()[: max_len - 2])
+    ids.append(3)
+    ids.extend([0] * (max_len - len(ids)))
+    return torch.tensor(ids[:max_len], dtype=torch.long)
+
+
+def _stable_word_id(word: str, vocab_size: int) -> int:
+    digest = hashlib.sha1(word.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % max(vocab_size - 2, 1) + 2
+
+
+def _tokenize_pi05(text: str, max_len: int = 128, vocab_size: int = 32000) -> torch.Tensor:
+    """Deterministic placeholder tokenizer for the pi0.5 scaffold."""
+    ids = [0] * max_len
+    words = text.lower().split()
+    last_idx = 0
+    for i, word in enumerate(words[: max_len - 2], start=1):
+        ids[i] = _stable_word_id(word, vocab_size)
+        last_idx = i
+    ids[min(last_idx + 1, max_len - 1)] = 1
+    return torch.tensor(ids, dtype=torch.long)
 
 
 # ====================================================================
@@ -184,13 +395,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
             self.normalization_stats["action_std"] = combined.std(axis=0) + 1e-8
 
     def __len__(self) -> int:
-        if self.split == "train":
-            n = int(len(self.episode_refs) * self.config._split_ratios[0])
-        elif self.split == "val":
-            n = int(len(self.episode_refs) * self.config._split_ratios[1])
-        else:
-            n = len(self.episode_refs) - int(len(self.episode_refs) * (self.config.train_split + self.config.val_split))
-        return max(n, 1)
+        # HDF5 episodes can have different lengths.  We keep the public length
+        # episode-based for memory safety and choose a random timestep inside
+        # each selected episode in __getitem__.
+        return max(len(_split_items(self.episode_refs, self.config, self.split)), 1)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Get a single training sample.
@@ -201,17 +409,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         Returns:
             Dictionary with keys: images, actions, state, language.
         """
-        # Map split index to actual episode index
-        if self.split == "train":
-            ep_idx = int(idx / max(1, math.ceil(len(self.episode_refs) * self.config._split_ratios[0])))
-        elif self.split == "val":
-            ep_idx = int(len(self.episode_refs) * self.config._split_ratios[0]) + idx
-        else:
-            ep_idx = len(self.episode_refs) - int(len(self.episode_refs) * self.config.test_split) + idx
-            ep_idx = min(ep_idx, len(self.episode_refs) - 1)
-
-        ep_idx = min(ep_idx, len(self.episode_refs) - 1)
-        ep_name = self.episode_refs[ep_idx]
+        split_refs = _split_items(self.episode_refs, self.config, self.split)
+        ep_name = split_refs[idx % len(split_refs)]
         episode = self.h5_file[f"data/{ep_name}"]
 
         # Load actions
@@ -222,7 +421,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 break
 
         if actions is None:
-            actions = np.zeros((1, 14), dtype=np.float32)
+            actions = np.zeros((1, self.config.action_dim), dtype=np.float32)
 
         # Select a random timestep within the episode
         seq_len = len(actions)
@@ -239,9 +438,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         # Load state
         if self.config.state_key in episode:
-            state = episode[self.config.state_key][t]
+            states = episode[self.config.state_key][()]
         else:
-            state = np.zeros(28, dtype=np.float32)
+            states = np.zeros((1, self.config.state_dim), dtype=np.float32)
 
         # Load language instruction
         if self.config.language_key in episode:
@@ -259,10 +458,18 @@ class LeRobotDataset(torch.utils.data.Dataset):
             std = self.normalization_stats["action_std"]
             actions = (actions - mean) / (std + 1e-8)
 
+        action_chunk, action_mask = _slice_action_chunk(
+            actions,
+            t,
+            self.config.action_chunk_size,
+            self.config.action_dim,
+        )
+
         return {
             "images": images,
-            "actions": torch.tensor(actions, dtype=torch.float32),
-            "state": torch.tensor(state, dtype=torch.float32),
+            "actions": torch.tensor(action_chunk, dtype=torch.float32),
+            "action_mask": torch.tensor(action_mask, dtype=torch.bool),
+            "state": torch.tensor(_slice_state(states, t, self.config.state_dim), dtype=torch.float32),
             "language": instruction,
         }
 
@@ -489,7 +696,8 @@ class DirectoryDataset(torch.utils.data.Dataset):
         if not episode_dirs:
             raise FileNotFoundError(f"No episode directories found in {self.data_dir}")
 
-        self.episode_dirs = episode_dirs[: self.config.max_dataset_size] if self.config.max_dataset_size > 0 else episode_dirs
+        episode_dirs = episode_dirs[: self.config.max_dataset_size] if self.config.max_dataset_size > 0 else episode_dirs
+        self.episode_dirs = _split_items(episode_dirs, self.config, self.split)
 
         # Compute normalisation stats from the first few episodes
         if self.config.normalize_actions:
@@ -548,24 +756,20 @@ class DirectoryDataset(torch.utils.data.Dataset):
 
         # Load actions
         actions_path = os.path.join(ep_dir, "actions.npy")
-        actions = np.load(actions_path) if os.path.exists(actions_path) else np.zeros((1, 14), dtype=np.float32)
+        actions = np.load(actions_path) if os.path.exists(actions_path) else np.zeros((1, self.config.action_dim), dtype=np.float32)
 
         # Load state
         state_path = os.path.join(ep_dir, "states.npy")
-        state = np.load(state_path) if os.path.exists(state_path) else np.zeros(28, dtype=np.float32)
+        states = np.load(state_path) if os.path.exists(state_path) else np.zeros((1, self.config.state_dim), dtype=np.float32)
 
-        # Load images for this timestep
-        images = {}
-        for key in self.config.image_keys:
-            img_path = os.path.join(ep_dir, "images", f"{key}.npy")
-            if os.path.exists(img_path):
-                img_arr = np.load(img_path)
-                if img_arr.shape[0] > t:
-                    images[key] = img_arr[t]
-                else:
-                    images[key] = np.zeros((self.config.image_size, self.config.image_size, 3), dtype=np.uint8)
-            else:
-                images[key] = np.zeros((self.config.image_size, self.config.image_size, 3), dtype=np.uint8)
+        # Load images for this timestep.  Supports both the nested multi-camera
+        # layout and the simple collector layout with root-level images.npy.
+        images = _load_episode_images(
+            ep_dir,
+            t,
+            self.config.image_keys,
+            self.config.image_size,
+        )
 
         # Normalize actions
         if self.config.normalize_actions and self.normalization_stats:
@@ -573,10 +777,18 @@ class DirectoryDataset(torch.utils.data.Dataset):
             std = self.normalization_stats["action_std"]
             actions = (actions - mean) / (std + 1e-8)
 
+        action_chunk, action_mask = _slice_action_chunk(
+            actions,
+            t,
+            self.config.action_chunk_size,
+            self.config.action_dim,
+        )
+
         return {
             "images": images,
-            "actions": torch.tensor(actions, dtype=torch.float32),
-            "state": torch.tensor(state, dtype=torch.float32),
+            "actions": torch.tensor(action_chunk, dtype=torch.float32),
+            "action_mask": torch.tensor(action_mask, dtype=torch.bool),
+            "state": torch.tensor(_slice_state(states, t, self.config.state_dim), dtype=torch.float32),
             "language": language,
         }
 
@@ -642,7 +854,8 @@ class ALOHADataset(torch.utils.data.Dataset):
         if not episode_dirs:
             raise FileNotFoundError(f"No ALOHA episodes found in {self.data_dir}")
 
-        self.episode_dirs = episode_dirs[: self.config.max_dataset_size] if self.config.max_dataset_size > 0 else episode_dirs
+        episode_dirs = episode_dirs[: self.config.max_dataset_size] if self.config.max_dataset_size > 0 else episode_dirs
+        self.episode_dirs = _split_items(episode_dirs, self.config, self.split)
 
         # Compute per-arm normalisation stats
         if self.config.normalize_actions:
@@ -706,54 +919,54 @@ class ALOHADataset(torch.utils.data.Dataset):
 
         # Load actions
         actions_path = os.path.join(ep_dir, "actions.npy")
-        actions = np.load(actions_path) if os.path.exists(actions_path) else np.zeros((1, 28), dtype=np.float32)
+        actions = np.load(actions_path) if os.path.exists(actions_path) else np.zeros((1, self.config.action_dim), dtype=np.float32)
 
         # Load state
         state_path = os.path.join(ep_dir, "states.npy")
-        state = np.load(state_path) if os.path.exists(state_path) else np.zeros(28, dtype=np.float32)
+        states = np.load(state_path) if os.path.exists(state_path) else np.zeros((1, self.config.state_dim), dtype=np.float32)
 
         # Load images (ALOHA-specific camera names)
-        images = {}
         aloha_image_keys = [
             "image", "image_manipulator_1", "image_manipulator_2",
         ]
-        for key in aloha_image_keys:
-            img_path = os.path.join(ep_dir, "images", f"{key}.npy")
-            if os.path.exists(img_path):
-                img_arr = np.load(img_path)
-                if img_arr.shape[0] > t:
-                    images[key] = img_arr[t]
-                else:
-                    images[key] = np.zeros((self.config.image_size, self.config.image_size, 3), dtype=np.uint8)
-            else:
-                images[key] = np.zeros((self.config.image_size, self.config.image_size, 3), dtype=np.uint8)
+        images = _load_episode_images(
+            ep_dir,
+            t,
+            aloha_image_keys,
+            self.config.image_size,
+        )
 
         # Normalize actions with per-arm statistics
         if self.config.normalize_actions and self.normalization_stats:
             if "left_action_mean" in self.normalization_stats:
-                # ALOHA-specific: normalise left and right arms separately
                 actions = np.array(actions, dtype=np.float32)
-                # Ensure actions is 1D (N, action_dim) -> if loaded as (1, 28) slice to first row
-                if actions.ndim == 2 and actions.shape[0] == 1:
-                    actions = actions[0]
-                # Left arm (joints 0-6)
-                for j in range(7):
-                    if self.normalization_stats["left_action_std"][j] > 0:
-                        actions[j] = (actions[j] - self.normalization_stats["left_action_mean"][j]) / self.normalization_stats["left_action_std"][j]
-                # Right arm (joints 7-13)
-                for j in range(7):
-                    if self.normalization_stats["right_action_std"][j] > 0:
-                        actions[7 + j] = (actions[7 + j] - self.normalization_stats["right_action_mean"][j]) / self.normalization_stats["right_action_std"][j]
+                if actions.ndim == 1:
+                    actions = actions.reshape(1, -1)
+                if actions.shape[1] >= 14:
+                    actions[:, :7] = (
+                        actions[:, :7] - self.normalization_stats["left_action_mean"]
+                    ) / self.normalization_stats["left_action_std"]
+                    actions[:, 7:14] = (
+                        actions[:, 7:14] - self.normalization_stats["right_action_mean"]
+                    ) / self.normalization_stats["right_action_std"]
             else:
                 # Fallback: global normalisation
                 mean = self.normalization_stats.get("action_mean", np.zeros(28))
                 std = self.normalization_stats.get("action_std", np.ones(28) + 1e-8)
                 actions = (actions - mean) / (std + 1e-8)
 
+        action_chunk, action_mask = _slice_action_chunk(
+            actions,
+            t,
+            self.config.action_chunk_size,
+            self.config.action_dim,
+        )
+
         return {
             "images": images,
-            "actions": torch.tensor(actions, dtype=torch.float32),
-            "state": torch.tensor(state, dtype=torch.float32),
+            "actions": torch.tensor(action_chunk, dtype=torch.float32),
+            "action_mask": torch.tensor(action_mask, dtype=torch.bool),
+            "state": torch.tensor(_slice_state(states, t, self.config.state_dim), dtype=torch.float32),
             "language": language,
         }
 
@@ -762,7 +975,16 @@ class ALOHADataset(torch.utils.data.Dataset):
 # Collate Function
 # ====================================================================
 
-def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+def collate_fn(
+    batch: List[Dict[str, Any]],
+    mode: str = "act",
+    image_size: int = 224,
+    num_cameras: int = 3,
+    action_chunk_size: int = 32,
+    action_dim: int = 14,
+    state_dim: int = 28,
+    max_language_len: int = 128,
+) -> Dict[str, Any]:
     """Collate a batch of samples for training.
 
     Handles variable-length sequences by padding actions to the longest
@@ -786,28 +1008,46 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         states_list.append(sample["state"])
         languages.append(sample["language"])
 
-    # Batch images (dictionary of arrays)
-    batched_images = {}
-    for key in images_list[0].keys():
-        img_arrs = [img[key] for img in images_list]
-        # Convert to numpy if needed
-        if isinstance(img_arrs[0], torch.Tensor):
-            batched_images[key] = torch.stack(img_arrs, dim=0)
-        else:
-            batched_images[key] = np.stack(img_arrs, axis=0)
+    # Batch images into the model-ready shape:
+    # (B, num_cameras, 3, image_size, image_size)
+    batched_images = torch.stack([
+        _image_dict_to_tensor(img, num_cameras=num_cameras, image_size=image_size, mode=mode)
+        for img in images_list
+    ], dim=0)
 
-    # Pad actions to the longest sequence in the batch
-    max_len = max(a.size(0) for a in actions_list)
-    action_dim = actions_list[0].size(1)
+    # Pad actions to the requested chunk length.  action_mask follows the
+    # convention used by ACTLoss: True means "ignore this padded timestep".
+    max_len = max(action_chunk_size, max(a.size(0) for a in actions_list))
     batched_actions = torch.zeros(len(batch), max_len, action_dim, dtype=torch.float32)
-    action_mask = torch.zeros(len(batch), max_len, dtype=torch.bool)
+    action_mask = torch.ones(len(batch), max_len, dtype=torch.bool)
     for i, act in enumerate(actions_list):
-        L = act.size(0)
-        batched_actions[i, :L, :] = act
-        action_mask[i, :L] = True
+        act = act.float()
+        L = min(act.size(0), max_len)
+        D = min(act.size(1), action_dim)
+        batched_actions[i, :L, :D] = act[:L, :D]
+        sample_mask = batch[i].get("action_mask")
+        if sample_mask is not None:
+            sample_mask = sample_mask.bool()[:L]
+            action_mask[i, :L] = sample_mask
+        else:
+            action_mask[i, :L] = False
 
     # Stack states (already fixed size)
-    batched_states = torch.stack(states_list, dim=0)
+    batched_states = torch.stack([
+        torch.tensor(_pad_or_trim_vector(state, state_dim), dtype=torch.float32)
+        for state in states_list
+    ], dim=0)
+
+    if mode == "pi05":
+        language_ids = torch.stack([
+            _tokenize_pi05(lang, max_len=max_language_len)
+            for lang in languages
+        ], dim=0)
+    else:
+        language_ids = torch.stack([
+            _tokenize_act(lang, max_len=max_language_len)
+            for lang in languages
+        ], dim=0)
 
     return {
         "images": batched_images,
@@ -815,6 +1055,7 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "state": batched_states,
         "action_mask": action_mask,
         "language": languages,
+        "language_ids": language_ids,
     }
 
 

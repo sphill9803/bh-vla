@@ -908,18 +908,17 @@ class SO101Robot:
         if bh_vla_dir not in __import__("sys").path:
             __import__("sys").path.insert(0, bh_vla_dir)
 
-        from policies.act import ACTPolicy, ACTConfig
-        from policies.pi05 import Pi05Policy, Pi05Config
+        from policies.act import ACTPolicy, ACTConfig, CharacterTokenizer
+        from policies.pi05 import Pi05Policy, Pi05Config, Pi05DataPreprocessor
 
         # Detect policy mode from checkpoint filename
         if "pi05" in checkpoint_path.lower() or "pi_05" in checkpoint_path.lower():
             policy_config = Pi05Config(flow_steps=flow_steps)
-            self.policy = Pi05Policy(policy_config)
+            self.policy = Pi05Policy.load_checkpoint(checkpoint_path, config=policy_config)
         else:
             policy_config = ACTConfig()
-            self.policy = ACTPolicy(policy_config)
+            self.policy = ACTPolicy.load_checkpoint(checkpoint_path, config=policy_config)
 
-        self.policy.load_checkpoint(checkpoint_path)
         device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
         self.policy = self.policy.to(device)
 
@@ -967,7 +966,25 @@ class SO101Robot:
                 state_t = torch.tensor(obs["state"], dtype=torch.float32).unsqueeze(0).to(device)
 
                 # Run policy forward pass
-                action = self.policy.predict_action(images_t, language, state_t)
+                if isinstance(self.policy, ACTPolicy):
+                    mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, device=device).view(1, 1, 3, 1, 1)
+                    std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, device=device).view(1, 1, 3, 1, 1)
+                    images_t = (images_t - mean) / std
+                    tokenizer = CharacterTokenizer()
+                    token_ids = torch.tensor(tokenizer.encode(language), dtype=torch.long, device=device).unsqueeze(0)
+                    action = self.policy.predict_action(images_t, token_ids, state_t)
+                else:
+                    images_t = (images_t - 0.5) / 0.5
+                    token_ids = torch.tensor(
+                        Pi05DataPreprocessor.tokenize_text(
+                            language,
+                            max_len=self.policy.config.text_max_len,
+                            vocab_size=self.policy.config.text_vocab_size,
+                        ),
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    action = self.policy.predict_action(images_t, token_ids, num_steps=flow_steps)
                 action_np = action.cpu().numpy()
 
                 # Send action to the robot

@@ -226,29 +226,29 @@ def _collect_robot_episode(args: argparse.Namespace, robot, instruction: str) ->
     frame_count = 0
 
     print("Recording... Move the leader arm to demonstrate.")
-    print("Press Enter to stop recording.")
+    print("Press Ctrl+C to stop recording early.")
 
-    while frame_count < args.max_frames:
-        ret, frame = cap.read()
-        if ret:
-            frame = cv2.resize(frame, (args.image_size, args.image_size))
-            frames.append(frame)
+    try:
+        while frame_count < args.max_frames:
+            ret, frame = cap.read()
+            if ret:
+                frame = cv2.resize(frame, (args.image_size, args.image_size))
+                frames.append(frame)
 
-        # Get state
-        try:
-            obs = robot.get_observation()
-            states.append(obs["state"])
-            actions.append(obs["state"].copy())
-        except Exception:
-            # If robot communication fails, use synthetic state
-            states.append(np.random.randn(28))
-            actions.append(np.random.randn(28))
+            # Get state
+            try:
+                obs = robot.get_observation()
+                states.append(obs["state"])
+                actions.append(obs["state"].copy())
+            except Exception:
+                # If robot communication fails, use synthetic state
+                states.append(np.random.randn(28))
+                actions.append(np.random.randn(28))
 
-        frame_count += 1
-
-        # Stop condition
-        if input() == "":
-            break
+            frame_count += 1
+            time.sleep(1.0 / max(args.camera_fps, 1))
+    except KeyboardInterrupt:
+        print("\nRecording stopped by user.")
 
     cap.release()
     end_time = time.time()

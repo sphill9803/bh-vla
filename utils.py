@@ -233,6 +233,7 @@ def save_checkpoint(
         "epoch": epoch,
         "training_state": state,
         "mode": mode,
+        "config": getattr(getattr(model, "config", None), "__dict__", None),
     }
     torch.save(checkpoint, path)
     print(f"Checkpoint saved to {path} (epoch {epoch})")

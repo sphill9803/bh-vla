@@ -34,14 +34,16 @@ from __future__ import annotations
 import os
 import math
 import warnings
+import hashlib
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import RMSNorm
+from PIL import Image
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -106,6 +108,12 @@ class Pi05Config:
     # ---- Multimodal projector ----
     projector_layers: int = 2      # Linear → GELU → (Linear → LayerNorm)²
 
+    @classmethod
+    def from_dict(cls, values: Dict[str, Any]) -> "Pi05Config":
+        """Create config from a dict, ignoring unknown keys for robustness."""
+        allowed = cls.__dataclass_fields__.keys()
+        return cls(**{k: v for k, v in values.items() if k in allowed})
+
 
 # ---------------------------------------------------------------------------
 # Utility: RoPE (Rotary Positional Embeddings)
@@ -134,32 +142,36 @@ def apply_rope(
     freqs: torch.Tensor,
     seq_len: int,
 ) -> torch.Tensor:
-    """Apply rotary positional embeddings to a tensor of shape (B, L, dim).
+    """Apply rotary positional embeddings to (B, L, D) or (B, H, L, D).
 
     We build a (L, dim//2, 2) rotation matrix from the pre-computed
     inverse frequencies and the position indices 0…seq_len-1.
     The result is a per-token rotation of each (2i, 2i+1) pair.
     """
-    B, L, D = x.shape
-    S = seq_len
+    if x.ndim == 3:
+        L, D = x.shape[1], x.shape[2]
+        broadcast_shape = (1, L, D // 2)
+    elif x.ndim == 4:
+        L, D = x.shape[2], x.shape[3]
+        broadcast_shape = (1, 1, L, D // 2)
+    else:
+        raise ValueError(f"RoPE expects a 3D or 4D tensor, got shape {tuple(x.shape)}")
+
+    S = min(seq_len, L)
     assert D % 2 == 0
 
-    freqs_cis = freqs.unsqueeze(0).unsqueeze(0)             # (1, 1, D//2, 1)
-    t = torch.arange(S, device=x.device, dtype=freqs.dtype)  # (S,)
-    freqs_pos = t.unsqueeze(1) * freqs_cis                   # (S, 1, D//2, 1)
-
-    # Split into even/odd pairs and form cos/sin complex rotation
-    # freqs_pos has shape (S, 1, D//2, 1) → we reshape
-    freqs_pos = freqs_pos.squeeze(-1)                       # (S, D//2)
-    cos = torch.cos(freqs_pos)                              # (S, D//2)
-    sin = torch.sin(freqs_pos)                              # (S, D//2)
+    inv_freq = freqs.squeeze(-1).to(x.device)
+    t = torch.arange(S, device=x.device, dtype=inv_freq.dtype)
+    freqs_pos = t[:, None] * inv_freq[None, :]
+    cos = torch.cos(freqs_pos).view(*broadcast_shape)
+    sin = torch.sin(freqs_pos).view(*broadcast_shape)
 
     x_even = x[..., 0::2].float()
     x_odd  = x[..., 1::2].float()
 
     x_rotated = torch.zeros_like(x, dtype=torch.float32)
-    x_rotated[..., 0::2] = x_even * cos.unsqueeze(1) - x_odd * sin.unsqueeze(1)
-    x_rotated[..., 1::2] = x_even * sin.unsqueeze(1) + x_odd * cos.unsqueeze(1)
+    x_rotated[..., 0::2] = x_even * cos - x_odd * sin
+    x_rotated[..., 1::2] = x_even * sin + x_odd * cos
     return x_rotated.to(x.dtype)
 
 
@@ -208,7 +220,7 @@ class MultiHeadAttention(nn.Module):
         self.head_dim = hidden_size // num_heads
         self.causal = causal
         self.rotary_emb_fn = rotary_emb_fn
-        self.rotary_freqs = rotary_freqs
+        self.register_buffer("rotary_freqs", rotary_freqs.clone().detach(), persistent=False)
         self.max_seq_len = max_seq_len
 
         self.qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
@@ -243,8 +255,8 @@ class MultiHeadAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]                  # each (B, H, L, hd)
 
         # Rotary positional embeddings
-        q = self.rotary_emb_fn(q, self.rotary_freqs, self.max_seq_len)
-        k = self.rotary_emb_fn(k, self.rotary_freqs, self.max_seq_len)
+        q = self.rotary_emb_fn(q, self.rotary_freqs, L)
+        k = self.rotary_emb_fn(k, self.rotary_freqs, L)
 
         # Scaled dot-product attention
         attn = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, H, L, L)
@@ -690,7 +702,12 @@ class FlowMatchingSampler:
         """
         if noise is None:
             B = images.shape[0]
-            C, D = self._get_shapes(images, language_ids)
+            owner = getattr(velocity_net, "__self__", None)
+            cfg = getattr(owner, "config", None)
+            if cfg is not None:
+                C, D = cfg.action_chunk_size, cfg.action_dim
+            else:
+                C, D = self._get_shapes(images, language_ids)
             noise = torch.randn(B, C, D, device=images.device)
 
         x = noise.clone()
@@ -858,6 +875,21 @@ class Pi05Policy(nn.Module):
             chunk_size=config.action_chunk_size,
         )
 
+        self.action_condition_proj = nn.Sequential(
+            nn.Linear(config.action_dim + 1, config.llm_width),
+            nn.GELU(approximate="tanh"),
+            nn.LayerNorm(config.llm_width, eps=1e-6),
+        )
+
+        self.multimodal_attn = MultiHeadAttention(
+            hidden_size=config.llm_width,
+            num_heads=config.llm_heads,
+            rotary_emb_fn=apply_rope,
+            rotary_freqs=self.llm_decoder.rope_freqs,
+            max_seq_len=max_text_seq + max_vision_seq + 4,
+            causal=True,
+        )
+
         # 5. Flow matching sampler
         self.flow_matching = FlowMatchingSampler(sigma=config.flow_sigma)
 
@@ -898,62 +930,53 @@ class Pi05Policy(nn.Module):
         Returns:
             actions: (B, chunk_size, action_dim)
         """
-        # Handle multi-camera: stack or process each view
-        if images.ndim == 5:
-            B, N, C, H, W = images.shape
-            images = images.view(B * N, C, H, W)
-            language_ids = language_ids.repeat_interleave(N, dim=0)
-
-        # --- Vision encoding ---
-        cls_token, patch_features = self.vision_encoder(images)
-        # patch_features: (B, NP, vision_width)
-
-        # --- Project vision to LLM space ---
-        vision_in_llm = self.multimodal_projector(patch_features)  # (B, NP, llm_width)
-
-        # --- Language encoding ---
-        text_features = self.llm_decoder(language_ids)  # (B, TL, llm_width)
-
-        # --- Concatenate multimodal features ---
-        # Append action-pooling token: [vision_tokens | text_tokens | action_pool]
-        B, NP, D = vision_in_llm.shape
-        action_pool = self.action_pool.expand(B, 1, D)
-        multimodal = torch.cat([vision_in_llm, text_features, action_pool], dim=1)  # (B, NP+TL+1, D)
-
-        # --- Self-attention on multimodal sequence ---
-        # Create causal mask so action_pool can attend to vision + text
-        total_seq = multimodal.shape[1]
-        causal_mask = torch.triu(
-            torch.full((total_seq, total_seq), float("-inf"), device=multimodal.device),
-            diagonal=1,
-        )
-        # No masking for vision-vision or text-text cross-attention (full for each modality)
-        # Simple approach: let the LLaMA causal mask handle everything
-        multimodal = self._attn_on_multimodal(multimodal, causal_mask)
-
-        # --- Extract action token (last token = the pooled token) ---
-        action_token = multimodal[:, -1, :]  # (B, llm_width)
-
-        # --- Action expert → chunked actions ---
+        action_token = self._encode_action_token(images, language_ids)
         actions = self.action_expert(action_token)
         return actions
+
+    def _encode_action_token(
+        self,
+        images: torch.Tensor,
+        language_ids: torch.Tensor,
+        extra_tokens: Optional[List[torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """Encode image/text context and return one pooled action token per sample."""
+        original_batch = images.shape[0]
+        num_views = 1
+
+        if images.ndim == 5:
+            B, N, C, H, W = images.shape
+            original_batch = B
+            num_views = N
+            images = images.reshape(B * N, C, H, W)
+            language_ids = language_ids.repeat_interleave(N, dim=0)
+
+        _, patch_features = self.vision_encoder(images)
+        vision_in_llm = self.multimodal_projector(patch_features)
+        text_features = self.llm_decoder(language_ids)
+
+        B_view, _, D = vision_in_llm.shape
+        action_pool = self.action_pool.expand(B_view, 1, D)
+        pieces = [vision_in_llm, text_features]
+        if extra_tokens:
+            pieces.extend(extra_tokens)
+        pieces.append(action_pool)
+        multimodal = torch.cat(pieces, dim=1)
+
+        multimodal = self._attn_on_multimodal(multimodal)
+        action_token = multimodal[:, -1, :]
+
+        if num_views > 1:
+            action_token = action_token.view(original_batch, num_views, D).mean(dim=1)
+        return action_token
 
     def _attn_on_multimodal(
         self,
         x: torch.Tensor,
-        mask: Optional[torch.Tensor],
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Lightweight self-attention layer on the multimodal sequence."""
-        L = x.shape[1]
-        attn = MultiHeadAttention(
-            hidden_size=self.config.llm_width,
-            num_heads=self.config.llm_heads,
-            rotary_emb_fn=apply_rope,
-            rotary_freqs=self.llm_decoder.rope_freqs,
-            max_seq_len=L,
-            causal=True,
-        )
-        return attn(x, mask)
+        """Registered multimodal attention layer used by both train and inference."""
+        return self.multimodal_attn(x, mask)
 
     # ------------------------------------------------------------------
     # Training helpers
@@ -971,36 +994,35 @@ class Pi05Policy(nn.Module):
         predicts velocity conditioned on (x_t, t, images, language_ids).
         """
 
-        def velocity_fn(x_t: torch.Tensor, t: torch.Tensor, img: torch.Tensor, lang: torch.Tensor):
-            """
-            Velocity network: inject x_t as extra tokens into the multimodal sequence.
-            This mimics the PI paper's approach where the current state is part of context.
-            For simplicity we use x_t mean as an additional context token.
-            """
-            B = img.shape[0]
-            cls, patches = self.vision_encoder(img)
-            vision_llm = self.multimodal_projector(patches)
-            text = self.llm_decoder(lang)
-
-            # Add t as a scalar bias (sinusoidal position-like encoding)
-            t_enc = torch.sin(t * 1000.0).view(B, 1, 1)  # (B, 1, 1)
-            vision_llm = vision_llm + t_enc
-
-            action_pool_t = self.action_pool.expand(B, 1, self.config.llm_width)
-            x_t_mean = x_t.mean(dim=1, keepdim=True)  # (B, 1, D)
-            multimodal = torch.cat([vision_llm, text, action_pool_t, x_t_mean], dim=1)
-
-            L = multimodal.shape[1]
-            mask = torch.triu(torch.full((L, L), float("-inf"), device=img.device), diagonal=1)
-            multimodal = self._attn_on_multimodal(multimodal, mask)
-
-            action_tok = multimodal[:, -1, :]  # last = x_t_mean position
-            return self.action_expert(action_tok)
-
         loss = self.flow_matching.compute_flow_matching_loss(
-            velocity_fn, images, language_ids, ground_truth_actions,
+            self._predict_velocity, images, language_ids, ground_truth_actions,
         )
         return loss
+
+    def _predict_velocity(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        images: torch.Tensor,
+        language_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Velocity field v_t(x, context) used by flow matching."""
+        B = x_t.shape[0]
+        x_summary = x_t.mean(dim=1)
+        t_summary = t[..., :1].reshape(B, -1).mean(dim=1, keepdim=True)
+        cond = torch.cat([x_summary, t_summary], dim=1)
+        cond_token = self.action_condition_proj(cond).unsqueeze(1)
+
+        if images.ndim == 5:
+            _, N = images.shape[:2]
+            cond_token = cond_token.repeat_interleave(N, dim=0)
+
+        action_token = self._encode_action_token(
+            images,
+            language_ids,
+            extra_tokens=[cond_token],
+        )
+        return self.action_expert(action_token)
 
     # ------------------------------------------------------------------
     # Inference
@@ -1024,16 +1046,25 @@ class Pi05Policy(nn.Module):
             method: "euler" | "rk2" | "rk4"
 
         Returns:
-            actions: (B, chunk_size, action_dim)
+            First action of the sampled chunk, shape (B, action_dim) or (action_dim,).
         """
         self.eval()
-        return self.flow_matching.sample(
-            velocity_net=self.forward,  # wrapped as velocity net
+        singleton = False
+        if images.ndim == 4:
+            images = images.unsqueeze(0)
+            singleton = True
+        if language_ids.ndim == 1:
+            language_ids = language_ids.unsqueeze(0)
+
+        chunk = self.flow_matching.sample(
+            velocity_net=self._predict_velocity,
             images=images,
             language_ids=language_ids,
             num_steps=num_steps,
             method=method,
         )
+        action = chunk[:, 0, :]
+        return action.squeeze(0) if singleton else action
 
     # ------------------------------------------------------------------
     # Checkpointing
@@ -1047,6 +1078,8 @@ class Pi05Policy(nn.Module):
             "multimodal_projector": self.multimodal_projector.state_dict(),
             "llm_decoder": self.llm_decoder.state_dict(),
             "action_expert": self.action_expert.state_dict(),
+            "action_condition_proj": self.action_condition_proj.state_dict(),
+            "multimodal_attn": self.multimodal_attn.state_dict(),
             "action_pool": self.action_pool.data,
             "flow_sigma": self.flow_matching.sigma,
         }
@@ -1054,10 +1087,30 @@ class Pi05Policy(nn.Module):
         print(f"[Pi05Policy] Checkpoint saved → {path}")
 
     @classmethod
-    def load_checkpoint(cls, path: str, device: str = "cpu") -> "Pi05Policy":
+    def load_checkpoint(
+        cls,
+        path: str,
+        device: str = "cpu",
+        config: Optional[Pi05Config] = None,
+    ) -> "Pi05Policy":
         """Load a checkpoint into a new Pi05Policy instance."""
         state = torch.load(path, map_location=device, weights_only=False)
-        config = state["config"]
+        if "model_state_dict" in state:
+            if config is None and isinstance(state.get("config"), dict):
+                config = Pi05Config.from_dict(state["config"])
+            policy = cls(config or Pi05Config())
+            policy.load_state_dict(state["model_state_dict"])
+            policy.to(device)
+            policy.eval()
+            return policy
+        if "vision_encoder" not in state:
+            policy = cls(config or Pi05Config())
+            policy.load_state_dict(state)
+            policy.to(device)
+            policy.eval()
+            return policy
+
+        config = state.get("config", config or Pi05Config())
         policy = cls(config)
         policy.device = torch.device(device)
 
@@ -1065,6 +1118,10 @@ class Pi05Policy(nn.Module):
         policy.multimodal_projector.load_state_dict(state["multimodal_projector"])
         policy.llm_decoder.load_state_dict(state["llm_decoder"])
         policy.action_expert.load_state_dict(state["action_expert"])
+        if "action_condition_proj" in state:
+            policy.action_condition_proj.load_state_dict(state["action_condition_proj"])
+        if "multimodal_attn" in state:
+            policy.multimodal_attn.load_state_dict(state["multimodal_attn"])
         policy.action_pool.data = state["action_pool"].to(device)
         policy.flow_matching.sigma = state.get("flow_sigma", 0.02)
 
@@ -1134,12 +1191,11 @@ class Pi05DataPreprocessor:
     def _make_eval_transform() -> callable:
         """Eval transform: resize → tensor → normalize."""
         def transform(img: np.ndarray) -> torch.Tensor:
-            # Ensure RGB
+            if img.ndim == 2:
+                img = np.stack([img] * 3, axis=-1)
             if img.ndim == 3 and img.shape[2] == 4:
-                img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
-            elif img.ndim == 2:
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-            img = cv2.resize(img, (224, 224))
+                img = img[..., :3]
+            img = np.asarray(Image.fromarray(img.astype(np.uint8)).resize((224, 224), Image.BILINEAR))
             tensor = torch.from_numpy(img).permute(2, 0, 1).float()
             tensor = tensor / 255.0
             # SigLIP / CLIP normalization
@@ -1153,14 +1209,18 @@ class Pi05DataPreprocessor:
     def _make_train_transform() -> callable:
         """Train transform: augmentation + resize → tensor → normalize."""
         def transform(img: np.ndarray) -> torch.Tensor:
+            if img.ndim == 2:
+                img = np.stack([img] * 3, axis=-1)
+            if img.ndim == 3 and img.shape[2] == 4:
+                img = img[..., :3]
+
             # Augmentation: random crop
             h, w = img.shape[:2]
             crop_size = min(h, w)
-            if crop_size < 224:
-                crop_size = 224
-            y1 = np.random.randint(0, h - crop_size + 1)
-            x1 = np.random.randint(0, w - crop_size + 1)
-            img = img[y1:y1+crop_size, x1:x1+crop_size]
+            if crop_size > 1:
+                y1 = np.random.randint(0, h - crop_size + 1)
+                x1 = np.random.randint(0, w - crop_size + 1)
+                img = img[y1:y1+crop_size, x1:x1+crop_size]
 
             # Random horizontal flip
             if np.random.rand() > 0.5:
@@ -1172,13 +1232,7 @@ class Pi05DataPreprocessor:
                 img = (img.astype(np.float32) * factor).clip(0, 255).astype(np.uint8)
 
             # Resize
-            img = cv2.resize(img, (224, 224))
-
-            # Convert to RGB if needed
-            if img.ndim == 3 and img.shape[2] == 4:
-                img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
-            elif img.ndim == 2:
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            img = np.asarray(Image.fromarray(img.astype(np.uint8)).resize((224, 224), Image.BILINEAR))
 
             tensor = torch.from_numpy(img).permute(2, 0, 1).float()
             tensor = tensor / 255.0
@@ -1209,15 +1263,18 @@ class Pi05DataPreprocessor:
         # First token is usually a special BOS token
         token_ids[0] = 0  # BOS
 
-        for i, word in enumerate(words):
-            if i + 1 >= max_len - 1:
+        last_idx = 0
+        for i, word in enumerate(words, start=1):
+            if i >= max_len - 1:
                 break
             # Hash-based token ID (bounded to vocab)
-            tid = hash(word) % (vocab_size - 2) + 2  # skip pad(0) and eos(1)
-            token_ids[i + 1] = tid
+            digest = hashlib.sha1(word.encode("utf-8")).hexdigest()
+            tid = int(digest[:8], 16) % max(vocab_size - 2, 1) + 2
+            token_ids[i] = tid
+            last_idx = i
 
         # End-of-sequence
-        token_ids[min(max_len - 1, i + 1)] = eos_id
+        token_ids[min(max_len - 1, last_idx + 1)] = eos_id
         return np.array(token_ids, dtype=np.int64)
 
     def normalize_action(self, action: np.ndarray) -> np.ndarray:

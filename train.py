@@ -39,6 +39,7 @@ import sys
 import time
 import json
 import logging
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Optional, List
 
@@ -99,15 +100,17 @@ def setup_accelerate(args: argparse.Namespace):
 
     try:
         from accelerate import Accelerator
+        from accelerate.utils import DeepSpeedPlugin
     except ImportError:
         raise ImportError("accelerate is required for --use-accelerate. "
                           "Install with: pip install accelerate")
 
-    deepspeed_config = {}
+    deepspeed_plugin = None
     if getattr(args, "deepspeed_config", None):
         with open(args.deepspeed_config, "r") as f:
             import yaml
             deepspeed_config = yaml.safe_load(f)
+        deepspeed_plugin = DeepSpeedPlugin(hf_ds_config=deepspeed_config)
 
     # Gradient accumulation
     accumulation_steps = getattr(args, "gradient_accumulation", 1)
@@ -123,7 +126,7 @@ def setup_accelerate(args: argparse.Namespace):
     accelerator = Accelerator(
         gradient_accumulation_steps=accumulation_steps,
         mixed_precision=mixed_precision,
-        deepspeed_plugin=deepspeed_config if deepspeed_config else None,
+        deepspeed_plugin=deepspeed_plugin,
     )
 
     logging.info(f"Accelerator configured: {accelerator}")
@@ -131,7 +134,8 @@ def setup_accelerate(args: argparse.Namespace):
     logging.info(f"  Mixed precision: {accelerator.mixed_precision}")
     logging.info(f"  Gradient accumulation: {accumulation_steps}")
     logging.info(f"  Number of processes: {accelerator.num_processes}")
-    logging.info(f"  Gradient bits: {accelerator.scaler.loss_scale}")
+    if getattr(accelerator, "scaler", None) is not None:
+        logging.info(f"  AMP scaler: {accelerator.scaler}")
 
     return accelerator
 
@@ -190,28 +194,29 @@ def train_one_epoch(
     model.train()
     epoch_loss = 0.0
     batch_count = 0
-
-    if accelerator is not None:
-        train_loader = accelerator.prepare(train_loader)
+    scaler = None
+    if accelerator is None and use_amp and torch.cuda.is_available():
+        from torch.cuda.amp import GradScaler
+        scaler = GradScaler(enabled=True)
 
     for batch in train_loader:
         images = batch["images"].to(device, non_blocking=True)
         actions_gt = batch["actions"].to(device, non_blocking=True)
         states = batch["state"].to(device, non_blocking=True)
-        language = batch["language"]
+        language_ids = batch["language_ids"].to(device, non_blocking=True)
+        action_mask = batch.get("action_mask")
+        if action_mask is not None:
+            action_mask = action_mask.to(device, non_blocking=True)
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         if accelerator is not None:
             # accelerator.prepare() handles AMP, DDP, etc. automatically
             if mode == "act":
-                actions_pred = model(images, language[0], states)
-                loss = loss_fn(actions_pred, actions_gt)
+                actions_pred = model(images, language_ids, states)
+                loss = loss_fn(actions_pred, actions_gt, action_mask)
             elif mode == "pi05":
-                text_ids = batch.get("language_ids",
-                                     torch.zeros(actions_gt.size(0), 64,
-                                                 dtype=torch.long, device=device))
-                loss = model.compute_flow_matching_loss(images, text_ids, actions_gt)
+                loss = model.compute_flow_matching_loss(images, language_ids, actions_gt)
             else:
                 raise ValueError(f"Unknown mode: {mode}")
             loss = loss.to(torch.float32)
@@ -219,20 +224,17 @@ def train_one_epoch(
             accelerator.backward(loss)
             if grad_clip > 0:
                 accelerator.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
         else:
             # Standard AMP path
-            if use_amp and torch.cuda.is_available():
-                from torch.cuda.amp import GradScaler, autocast
-                scaler = GradScaler(enabled=True)
+            if scaler is not None:
+                from torch.cuda.amp import autocast
                 with autocast():
                     if mode == "act":
-                        actions_pred = model(images, language[0], states)
-                        loss = loss_fn(actions_pred, actions_gt)
+                        actions_pred = model(images, language_ids, states)
+                        loss = loss_fn(actions_pred, actions_gt, action_mask)
                     elif mode == "pi05":
-                        text_ids = batch.get("language_ids",
-                                             torch.zeros(actions_gt.size(0), 64,
-                                                         dtype=torch.long, device=device))
-                        loss = model.compute_flow_matching_loss(images, text_ids, actions_gt)
+                        loss = model.compute_flow_matching_loss(images, language_ids, actions_gt)
                     else:
                         raise ValueError(f"Unknown mode: {mode}")
                     loss = loss.to(torch.float32)
@@ -244,13 +246,10 @@ def train_one_epoch(
                 scaler.update()
             else:
                 if mode == "act":
-                    actions_pred = model(images, language[0], states)
-                    loss = loss_fn(actions_pred, actions_gt)
+                    actions_pred = model(images, language_ids, states)
+                    loss = loss_fn(actions_pred, actions_gt, action_mask)
                 elif mode == "pi05":
-                    text_ids = batch.get("language_ids",
-                                         torch.zeros(actions_gt.size(0), 64,
-                                                     dtype=torch.long, device=device))
-                    loss = model.compute_flow_matching_loss(images, text_ids, actions_gt)
+                    loss = model.compute_flow_matching_loss(images, language_ids, actions_gt)
                 else:
                     raise ValueError(f"Unknown mode: {mode}")
 
@@ -285,25 +284,22 @@ def evaluate(
     epoch_loss = 0.0
     batch_count = 0
 
-    if accelerator is not None:
-        val_loader = accelerator.prepare(val_loader)
-
     with torch.no_grad():
         for batch in val_loader:
             images = batch["images"].to(device, non_blocking=True)
             actions_gt = batch["actions"].to(device, non_blocking=True)
             states = batch["state"].to(device, non_blocking=True)
-            language = batch["language"]
+            language_ids = batch["language_ids"].to(device, non_blocking=True)
+            action_mask = batch.get("action_mask")
+            if action_mask is not None:
+                action_mask = action_mask.to(device, non_blocking=True)
 
             if accelerator is not None:
                 if mode == "act":
-                    actions_pred = model(images, language[0], states)
-                    loss = F.mse_loss(actions_pred, actions_gt)
+                    actions_pred = model(images, language_ids, states)
+                    loss = ACTLoss()(actions_pred, actions_gt, action_mask)
                 elif mode == "pi05":
-                    text_ids = batch.get("language_ids",
-                                         torch.zeros(actions_gt.size(0), 64,
-                                                     dtype=torch.long, device=device))
-                    loss = model.compute_flow_matching_loss(images, text_ids, actions_gt)
+                    loss = model.compute_flow_matching_loss(images, language_ids, actions_gt)
                 else:
                     raise ValueError(f"Unknown mode: {mode}")
                 loss = loss.to(torch.float32)
@@ -313,25 +309,19 @@ def evaluate(
                     from torch.cuda.amp import autocast
                     with autocast():
                         if mode == "act":
-                            actions_pred = model(images, language[0], states)
-                            loss = F.mse_loss(actions_pred, actions_gt)
+                            actions_pred = model(images, language_ids, states)
+                            loss = ACTLoss()(actions_pred, actions_gt, action_mask)
                         elif mode == "pi05":
-                            text_ids = batch.get("language_ids",
-                                                 torch.zeros(actions_gt.size(0), 64,
-                                                             dtype=torch.long, device=device))
-                            loss = model.compute_flow_matching_loss(images, text_ids, actions_gt)
+                            loss = model.compute_flow_matching_loss(images, language_ids, actions_gt)
                         else:
                             raise ValueError(f"Unknown mode: {mode}")
                         loss = loss.to(torch.float32)
                 else:
                     if mode == "act":
-                        actions_pred = model(images, language[0], states)
-                        loss = F.mse_loss(actions_pred, actions_gt)
+                        actions_pred = model(images, language_ids, states)
+                        loss = ACTLoss()(actions_pred, actions_gt, action_mask)
                     elif mode == "pi05":
-                        text_ids = batch.get("language_ids",
-                                             torch.zeros(actions_gt.size(0), 64,
-                                                         dtype=torch.long, device=device))
-                        loss = model.compute_flow_matching_loss(images, text_ids, actions_gt)
+                        loss = model.compute_flow_matching_loss(images, language_ids, actions_gt)
                     else:
                         raise ValueError(f"Unknown mode: {mode}")
 
@@ -391,8 +381,7 @@ def train(args: argparse.Namespace) -> None:
         validate_config(config, args.mode)
 
     # 3. Create policy
-    factory = PolicyFactory()
-    policy = factory.create(args.mode)
+    policy = PolicyFactory.from_config(config)
 
     total_params = count_parameters(policy)
     trainable_params = count_trainable_parameters(policy)
@@ -402,7 +391,19 @@ def train(args: argparse.Namespace) -> None:
     policy = policy.to(device)
 
     # 4. Dataset loading
-    ds_config = DatasetConfig(data_dir=args.data_dir or "./data")
+    ds_config = DatasetConfig(
+        data_dir=args.data_dir or "./data",
+        image_size=getattr(config, "image_size", 224),
+        num_cameras=getattr(config, "num_cameras", 3),
+        action_chunk_size=getattr(config, "action_chunk_size", 32),
+        action_dim=getattr(config, "action_dim", 14),
+        state_dim=getattr(config, "state_dim", 28),
+        train_split=1.0 - args.val_split,
+        val_split=args.val_split,
+        test_split=0.0,
+        seed=args.seed,
+        mode=args.mode,
+    )
     if args.data_format == "lerobot":
         dataset_cls = LeRobotDataset
     elif args.data_format == "rlds":
@@ -432,11 +433,25 @@ def train(args: argparse.Namespace) -> None:
         dataset_stats = compute_dataset_stats(ds_config.data_dir)
         ensure_dir(os.path.dirname(stats_path))
         with open(stats_path, "w") as f:
-            json.dump(dataset_stats, f, indent=2)
+            json.dump(
+                {k: v.tolist() if hasattr(v, "tolist") else v for k, v in dataset_stats.items()},
+                f,
+                indent=2,
+            )
 
     # Split dataset by index
     train_ds = dataset_cls(ds_config.data_dir, ds_config, split="train")
     val_ds = dataset_cls(ds_config.data_dir, ds_config, split="val")
+    batch_collate = partial(
+        collate_fn,
+        mode=args.mode,
+        image_size=getattr(config, "image_size", 224),
+        num_cameras=getattr(config, "num_cameras", 3),
+        action_chunk_size=getattr(config, "action_chunk_size", 32),
+        action_dim=getattr(config, "action_dim", 14),
+        state_dim=getattr(config, "state_dim", 28),
+        max_language_len=getattr(config, "max_instr_len", getattr(config, "text_max_len", 128)),
+    )
 
     # DDP / distributed sampler
     if accelerator is not None and accelerator.num_processes > 1:
@@ -447,18 +462,18 @@ def train(args: argparse.Namespace) -> None:
         train_loader = DataLoader(train_ds, batch_size=config.batch_size,
                                   sampler=train_sampler,
                                   num_workers=args.num_workers,
-                                  collate_fn=collate_fn,
+                                  collate_fn=batch_collate,
                                   pin_memory=True)
         val_loader = DataLoader(val_ds, batch_size=config.batch_size,
                                 sampler=val_sampler,
                                 num_workers=args.num_workers,
-                                collate_fn=collate_fn,
+                                collate_fn=batch_collate,
                                 pin_memory=True)
     else:
         train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True,
-                                  num_workers=args.num_workers, collate_fn=collate_fn)
+                                  num_workers=args.num_workers, collate_fn=batch_collate)
         val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False,
-                                num_workers=args.num_workers, collate_fn=collate_fn)
+                                num_workers=args.num_workers, collate_fn=batch_collate)
 
     # Prepare model/optimizer/ scheduler with accelerator
     if accelerator is not None:
@@ -478,13 +493,13 @@ def train(args: argparse.Namespace) -> None:
         )
 
     # Scheduler
-    warmup_steps = config.warmup_steps or 1000
     total_steps = len(train_loader) * config.num_epochs
+    warmup_steps = min(config.warmup_steps or 1000, max(total_steps - 1, 1))
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps
     )
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=total_steps - warmup_steps, eta_min=config.lr * 0.01
+        optimizer, T_max=max(total_steps - warmup_steps, 1), eta_min=config.lr * 0.01
     )
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer,
@@ -531,16 +546,14 @@ def train(args: argparse.Namespace) -> None:
     else:
         logger.info("Starting fresh training.")
 
-    best_val_loss = float("inf")
-    train_state.best_val_loss = best_val_loss
+    best_val_loss = train_state.best_val_loss
     epoch = train_state.epoch
     progress = ProgressTracker(config.num_epochs, label="epoch")
+    training_start = time.time()
 
     for epoch in range(train_state.epoch, config.num_epochs):
         if accelerator is not None and hasattr(train_loader, 'sampler'):
             train_loader.sampler.set_epoch(epoch)
-
-        epoch_start = time.time()
 
         train_metrics = train_one_epoch(
             model=policy, train_loader=train_loader, optimizer=optimizer,
@@ -563,24 +576,28 @@ def train(args: argparse.Namespace) -> None:
                 torch.tensor(val_loss, device=device)
             ).mean().item())
 
-        if accelerator.is_main_process:
+        is_main_process = accelerator is None or accelerator.is_main_process
+        if is_main_process:
             # Only main process saves checkpoints
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 train_state.best_val_loss = best_val_loss
+                train_state.best_epoch = epoch
+                train_state.patience_counter = 0
                 ckpt_path = os.path.join(args.checkpoint_dir, f"{args.mode}_best.pt")
                 save_checkpoint(policy, optimizer, scheduler, epoch + 1,
                                 train_state.to_dict(), ckpt_path, args.mode)
                 logger.info(f"  New best val_loss: {val_loss:.6f} (checkpoint saved)")
+            else:
+                train_state.patience_counter += 1
 
-            elapsed = time.time() - epoch_start
             progress.update(
                 train_loss=train_metrics["train_loss"],
                 val_loss=val_loss,
                 lr=scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr')
                    else scheduler.get_lr()[0],
             )
-            progress.display(epoch + 1)
+            logger.info(progress.display(epoch + 1))
 
             if (epoch + 1) % args.save_interval == 0 or epoch + 1 == config.num_epochs:
                 ckpt_path = os.path.join(args.checkpoint_dir,
@@ -592,13 +609,6 @@ def train(args: argparse.Namespace) -> None:
             if epoch == train_state.epoch:
                 save_config_json(config, config_path, args.mode)
 
-            if val_loss > train_state.best_val_loss * 1.02:
-                train_state.patience_counter += 1
-            else:
-                train_state.best_val_loss = val_loss
-                best_val_loss = val_loss
-                train_state.patience_counter = 0
-
             if train_state.patience_counter >= args.patience:
                 logger.info(f"Early stopping at epoch {epoch+1}. "
                             f"Best val_loss: {best_val_loss:.6f}")
@@ -606,15 +616,16 @@ def train(args: argparse.Namespace) -> None:
 
         # Gather metrics from all processes in DDP
         if accelerator is not None:
-            gather_metrics = {
-                "train_loss": torch.tensor(train_metrics["train_loss"], device=device),
-                "val_loss": torch.tensor(val_loss, device=device),
-            }
-            gathered = accelerator.gather(gather_metrics)
+            gathered_train = accelerator.gather(
+                torch.tensor(train_metrics["train_loss"], device=device)
+            ).mean().item()
+            gathered_val = accelerator.gather(
+                torch.tensor(val_loss, device=device)
+            ).mean().item()
             if logger:
                 logger.info(f"Epoch {epoch+1}: "
-                            f"train_loss={gathered['train_loss'].mean().item():.6f} "
-                            f"val_loss={gathered['val_loss'].mean().item():.6f}")
+                            f"train_loss={gathered_train:.6f} "
+                            f"val_loss={gathered_val:.6f}")
 
     # Final checkpoint
     if accelerator is not None:
@@ -627,12 +638,13 @@ def train(args: argparse.Namespace) -> None:
         save_checkpoint(policy, optimizer, scheduler, epoch + 1,
                         train_state.to_dict(), final_ckpt, args.mode)
 
-    if accelerator.is_main_process:
+    is_main_process = accelerator is None or accelerator.is_main_process
+    if is_main_process:
         logger.info(f"\n{'='*60}")
         logger.info(f"  Training complete!")
         logger.info(f"  Best val_loss: {best_val_loss:.6f} "
                     f"(epoch {train_state.best_epoch+1})")
-        logger.info(f"  Total time: {time.time()-epoch_start:.0f}s")
+        logger.info(f"  Total time: {time.time()-training_start:.0f}s")
         logger.info(f"{'='*60}")
 
     if accelerator is not None:

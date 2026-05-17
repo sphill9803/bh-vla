@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 from torchvision.models import resnet18, resnet50
 from torchvision.models import ResNet18_Weights, ResNet50_Weights
+from torchvision.transforms import functional as TF
 
 
 # ============================================================================
@@ -303,16 +304,16 @@ class ACTConfig:
 
     Attributes:
         num_cameras: Number of camera views (default 3).
-        image_size: Input image size for each camera (H, W), default (120, 160).
+        image_size: Input image size for each camera (H, W), default (224, 224).
         backbone: ResNet variant, "resnet18" or "resnet50" (default "resnet18").
         hidden_dim: Model hidden dimension (default 256).
-        action_chunk_size: Number of future actions to predict per step (default 12).
-        action_dim: Number of action dimensions (robot joint positions, default 12 for ALOHA).
+        action_chunk_size: Number of future actions to predict per step (default 32).
+        action_dim: Number of action dimensions (robot joint positions, default 14 for ALOHA/SO-101).
         num_decoder_layers: Number of Transformer decoder layers (default 4).
         num_decoder_heads: Number of attention heads in decoder (default 8).
         num_layers_lang: Number of Transformer encoder layers for language (default 2).
         vocab_size: Tokenizer vocabulary size (default 128).
-        state_dim: Dimension of robot state input (default 12).
+        state_dim: Dimension of robot state input (default 28).
         dropout: Dropout rate for all layers (default 0.1).
         max_instr_len: Maximum instruction length (default 128).
         clip_norm: Gradient clipping norm (default 1.0).
@@ -325,16 +326,17 @@ class ACTConfig:
     """
 
     num_cameras: int = 3
-    image_size: Tuple[int, int] = (120, 160)
+    image_size: Tuple[int, int] = (224, 224)
     backbone: str = "resnet18"
+    pretrained_backbone: bool = False
     hidden_dim: int = 256
-    action_chunk_size: int = 12
-    action_dim: int = 12
+    action_chunk_size: int = 32
+    action_dim: int = 14
     num_decoder_layers: int = 4
     num_decoder_heads: int = 8
     num_layers_lang: int = 2
     vocab_size: int = 128
-    state_dim: int = 12
+    state_dim: int = 28
     dropout: float = 0.1
     max_instr_len: int = 128
     clip_norm: float = 1.0
@@ -344,6 +346,12 @@ class ACTConfig:
     gradient_clip: float = 1.0
     batch_size: int = 32
     num_epochs: int = 100
+
+    @classmethod
+    def from_dict(cls, values: Dict[str, Any]) -> "ACTConfig":
+        """Create config from a dict, ignoring unknown keys for robustness."""
+        allowed = cls.__dataclass_fields__.keys()
+        return cls(**{k: v for k, v in values.items() if k in allowed})
 
 
 class ACTPolicy(nn.Module):
@@ -377,6 +385,7 @@ class ACTPolicy(nn.Module):
         self.image_encoder = ResNetImageEncoder(
             backbone_name=config.backbone,
             num_cameras=config.num_cameras,
+            pretrained=config.pretrained_backbone,
             hidden_dim=config.hidden_dim,
         )
 
@@ -631,6 +640,7 @@ class ACTPolicy(nn.Module):
         cls,
         path: str,
         device: str | torch.device = "cpu",
+        config: Optional[ACTConfig] = None,
     ) -> ACTPolicy:
         """Load a checkpoint and return an ACTPolicy instance.
 
@@ -641,9 +651,11 @@ class ACTPolicy(nn.Module):
         Returns:
             Loaded ACTPolicy instance.
         """
-        # Create a default model (will be overwritten by load_state_dict)
-        policy = cls()
-        state_dict = torch.load(path, map_location=device, weights_only=True)
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
+        if config is None and isinstance(checkpoint, dict) and isinstance(checkpoint.get("config"), dict):
+            config = ACTConfig.from_dict(checkpoint["config"])
+        policy = cls(config)
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
         policy.load_state_dict(state_dict)
         policy = policy.to(device)
         policy.eval()
@@ -686,19 +698,15 @@ class ACTLoss(nn.Module):
         Returns:
             Scalar loss tensor.
         """
-        if mask is not None:
-            # masked_fill zeros out the masked entries; the count of valid
-            # positions ensures correct averaging.
-            valid_mask = (~mask).float()  # (B, chunk_size)
-            pred_masked = pred_chunk * valid_mask.unsqueeze(-1)
-            gt_masked = gt_chunk * valid_mask.unsqueeze(-1)
-            loss = self.mse_loss(pred_masked, gt_masked)
-            if self.reduction == "mean":
-                num_valid = valid_mask.sum().clamp(min=1)
-                loss = loss / valid_mask.numel() * num_valid
-        else:
-            loss = self.mse_loss(pred_chunk, gt_chunk)
-        return loss
+        if mask is None:
+            return self.mse_loss(pred_chunk, gt_chunk)
+
+        valid_mask = (~mask).unsqueeze(-1).to(pred_chunk.dtype)
+        squared_error = (pred_chunk - gt_chunk).pow(2) * valid_mask
+        if self.reduction == "sum":
+            return squared_error.sum()
+        denom = valid_mask.sum().clamp(min=1.0) * pred_chunk.shape[-1]
+        return squared_error.sum() / denom
 
 
 # ============================================================================
@@ -795,11 +803,9 @@ class ACTDataPreprocessor:
             Normalized array with the same shape.
         """
         images = images.astype(np.float32) / 255.0  # -> [0, 1]
-        mean = torch.tensor(self.IMAGENET_MEAN).view(1, 3, 1, 1, 1)
-        std = torch.tensor(self.IMAGENET_STD).view(1, 3, 1, 1, 1)
-        # Broadcast across the first (batch) dimension
-        images = (images - mean) / std
-        return images
+        mean = np.asarray(self.IMAGENET_MEAN, dtype=np.float32).reshape(1, 1, 3, 1, 1)
+        std = np.asarray(self.IMAGENET_STD, dtype=np.float32).reshape(1, 1, 3, 1, 1)
+        return (images - mean) / std
 
     def preprocess_sample(
         self,
@@ -870,9 +876,9 @@ class ACTDataPreprocessor:
                 img = img.flip(dims=[2])
             # Random color jitter
             if random.random() > 0.5:
-                img = F.adjust_brightness(img, 0.8 + 0.4 * random.random())
-                img = F.adjust_contrast(img, 0.8 + 0.4 * random.random())
-                img = F.adjust_saturation(img, 0.8 + 0.4 * random.random())
+                img = TF.adjust_brightness(img, 0.8 + 0.4 * random.random())
+                img = TF.adjust_contrast(img, 0.8 + 0.4 * random.random())
+                img = TF.adjust_saturation(img, 0.8 + 0.4 * random.random())
             aug_images.append(img)
         return torch.stack(aug_images)
 
