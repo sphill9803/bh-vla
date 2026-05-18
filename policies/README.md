@@ -6,7 +6,7 @@
 
 | 파일 | 역할 |
 |---|---|
-| `act.py` | ACT 정책입니다. 이미지, 언어, 현재 state를 받아 미래 action chunk를 바로 예측합니다. |
+| `act.py` | ACT 정책입니다. 이미지, 언어, 현재 state를 받아 CVAE latent와 Transformer로 미래 action chunk를 예측합니다. |
 | `pi05.py` | pi0.5 스타일 정책입니다. VLM 구조와 flow matching 행동 생성을 흉내 냅니다. |
 | `config.py` | `ACTConfig`, `Pi05Config`, `PolicyFactory`를 한곳에서 만들고 검증합니다. |
 | `__init__.py` | 외부에서 `from policies import ACTPolicy`처럼 쉽게 가져오게 해줍니다. |
@@ -49,13 +49,14 @@ pred_actions = act_policy(images, language_ids, state)
 
 1. `ResNetImageEncoder`
 
-   여러 카메라 이미지를 ResNet으로 읽습니다.
+   여러 카메라 이미지를 ResNet으로 읽고 spatial token으로 바꿉니다.
 
    ```text
    images
        (B, num_cameras, 3, H, W)
        -> 각 카메라를 ResNet에 통과
-       -> (B, num_cameras * hidden_dim)
+       -> feature map projection
+       -> (B, num_cameras * h * w, hidden_dim)
    ```
 
    전달되는 정보는 "어디에 물체가 있고 장면이 어떻게 생겼는가"입니다.
@@ -75,76 +76,97 @@ pred_actions = act_policy(images, language_ids, state)
 
    전달되는 정보는 "무엇을 해야 하는가"입니다.
 
-3. image feature와 language feature 결합
+3. latent, state, language, image token 결합
+
+   ACT는 학습 중 정답 action chunk를 보고 CVAE latent를 만듭니다. 추론 중에는 latent를 0으로 두고 행동을 예측합니다.
 
    ```text
-   visual_feats + lang_feats
-       -> concat
-       -> Linear + LayerNorm + GELU
-       -> fused context
+   training:
+       [cls | state | action chunk]
+       -> VAE encoder
+       -> mu, logvar
+       -> latent sample
+
+   inference:
+       latent = zeros
    ```
 
-   여기서 로봇은 "현재 장면에서 이 명령을 수행해야 한다"는 하나의 context를 갖게 됩니다.
-
-4. action token 생성
-
-   `action_chunk_size`개 만큼 learnable token을 만듭니다.
+   이어서 latent, state, language, image spatial token을 한 sequence로 묶어 Transformer encoder에 넣습니다.
 
    ```text
-   action_tokens
+   [latent token | state token | language token | image spatial tokens]
+       -> Transformer encoder
+       -> memory tokens
+   ```
+
+4. action query 생성
+
+   `action_chunk_size`개 만큼 learnable query를 만듭니다.
+
+   ```text
+   action_query
        (B, chunk_size, hidden_dim)
    ```
 
-   각 token은 "미래의 1번째 움직임", "미래의 2번째 움직임" 같은 자리표입니다.
+   각 query는 "미래의 1번째 움직임", "미래의 2번째 움직임" 같은 자리표입니다.
 
-5. state FiLM 주입
-
-   현재 로봇 state를 `gamma`, `beta`로 바꿔 Transformer decoder layer마다 넣습니다.
+5. Transformer decoder
 
    ```text
-   state
-       -> Linear
-       -> gamma, beta
-       -> decoder 내부 feature 조절
-   ```
-
-   전달되는 정보는 "지금 팔이 여기 있으니, 이 자세에서 시작해야 한다"입니다.
-
-6. Transformer decoder
-
-   action token들이 fused context를 cross-attention으로 봅니다.
-
-   ```text
-   action tokens query
-   fused context key/value
+   action query
+   memory tokens
        -> self attention
        -> cross attention
        -> feed-forward
    ```
 
-7. action head
+   action query들이 장면, 명령, 현재 state, latent 정보를 cross-attention으로 봅니다.
 
-   마지막으로 각 token을 실제 로봇 action 숫자로 바꿉니다.
+6. action head
+
+   마지막으로 각 decoder output을 실제 로봇 action 숫자로 바꿉니다.
 
    ```text
    decoder output
-       -> MLP
+       -> Linear
        -> (B, chunk_size, action_dim)
    ```
 
+### ACT loss와 추론
+
+학습에서는 `compute_loss(...)`가 masked L1 reconstruction loss와 KL loss를 함께 계산합니다.
+
+```python
+loss, metrics = act_policy.compute_loss(
+    images,
+    language_ids,
+    state,
+    actions,
+    action_mask,
+)
+```
+
+```text
+loss = masked_l1(pred_actions, actions) + kl_weight * KL(q(z | state, actions) || N(0, I))
+```
+
+추론에서는 `predict_action(...)` 또는 `select_action(...)`을 사용합니다. 기본은 `n_action_steps`만큼 action queue를 채워서 여러 step 동안 재사용하고, `temporal_ensemble_coeff`가 설정되어 있으면 매 step 새 chunk를 예측해 temporal ensemble을 계산합니다.
+
 ### ACT에서 논문 대비 빠진 로직
 
-현재 구현은 ACT 논문의 핵심인 action chunk 아이디어는 담고 있지만, 원 논문 전체를 그대로 재현하지는 않습니다.
+현재 구현은 ACT 논문과 LeRobot 구현의 주요 학습 구조를 반영하지만, LeRobot 전체 스택을 그대로 가져온 것은 아닙니다.
 
 | 논문 로직 | 현재 코드 상태 |
 |---|---|
 | action chunk 예측 | 있음 |
-| multi-camera 이미지 사용 | 있음 |
+| multi-camera 이미지 사용 | spatial token 방식으로 있음 |
 | 현재 로봇 state 조건화 | 있음 |
-| CVAE latent variable | 없음 |
-| KL loss | 없음 |
-| temporal ensemble | 없음 |
-| ALOHA 원본 episode 처리와 완전 동일한 loader | 아님 |
+| CVAE latent variable | 있음 |
+| KL loss | 있음 |
+| action queue | 있음 |
+| temporal ensemble | optional로 있음 |
+| LeRobot Hub dataset/processor 전체 호환 | 아직 아님 |
+| ALOHA 원본 episode 처리와 공식 평가 스택 | 아직 아님 |
 
 ## pi0.5 forward 흐름
 
@@ -300,6 +322,8 @@ state         (B, 28)
 actions       (B, 32, 14)
 prediction    (B, 32, 14)
 ```
+
+위 예시는 작은 디버깅 설정입니다. 현재 ACT 기본값은 LeRobot 쪽에 맞춰 `chunk_size=100`, `action_dim=14`, `state_dim=28`입니다. 빠른 smoke test나 작은 GPU에서는 `--chunk-size 16 --n-action-steps 4`처럼 줄여서 확인할 수 있습니다.
 
 pi0.5가 터지면 다음 shape부터 확인하세요.
 
