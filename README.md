@@ -14,23 +14,23 @@ bh-VLA는 로봇에게 일을 가르치기 위한 작은 Vision-Language-Action 
 
 | 정책 | 파일 | 한 줄 설명 | 현재 상태 |
 |---|---|---|---|
-| ACT | `policies/act.py` | 이미지를 보고 여러 개의 미래 행동을 한 번에 예측합니다. | 실행 가능한 경량 구현 |
+| ACT | `policies/act.py` | 이미지를 보고 여러 개의 미래 행동을 한 번에 예측합니다. | LeRobot/ACT 논문 구조를 반영한 주력 구현 |
 | pi0.5 | `policies/pi05.py` | 큰 VLM과 flow matching 방식의 행동 생성을 흉내 냅니다. | 연구용 스캐폴드 |
 
-중요합니다. 이 코드는 논문을 완전히 재현한 공식 구현이 아닙니다. 특히 pi0.5는 PaliGemma 사전학습 가중치와 실제 tokenizer, 대규모 co-training 데이터가 없기 때문에 논문 성능을 기대하면 안 됩니다. 현재 목적은 구조를 이해하고 작은 데이터로 실험하는 것입니다.
+중요합니다. 이 코드는 논문을 완전히 재현한 공식 구현이 아닙니다. ACT는 LeRobot과 원 논문의 주요 학습 구조를 더 많이 반영했지만, 여전히 공식 LeRobot 패키지 전체를 대체하지는 않습니다. 특히 pi0.5는 PaliGemma 사전학습 가중치와 실제 tokenizer, 대규모 co-training 데이터가 없기 때문에 논문 성능을 기대하면 안 됩니다. 현재 목적은 구조를 이해하고 작은 데이터로 실험하는 것입니다.
 
 ## 논문 기준 검토
 
 | 논문 | 코드에 들어간 핵심 아이디어 | 아직 빠진 부분 |
 |---|---|---|
-| ACT, arXiv:2304.13705 | action chunk 예측, multi-camera image encoder, Transformer decoder, 현재 state 조건부 행동 예측 | 원 논문의 CVAE latent, KL loss, temporal ensemble, ALOHA 원본 데이터 파이프라인 |
+| ACT, arXiv:2304.13705 | action chunk 예측, multi-camera spatial image tokens, Transformer encoder/decoder, 현재 state 조건부 행동 예측, CVAE latent, KL loss, action queue, optional temporal ensemble | 최신 LeRobot Hub dataset/processor 전체 호환, 공식 ALOHA 평가/rollout 스택 |
 | pi0.5, arXiv:2504.16054 | SigLIP 스타일 vision encoder, LLaMA 스타일 decoder, action expert, flow matching loss와 sampling 흐름 | 실제 PaliGemma 3B 가중치, 실제 tokenizer, 대규모 heterogeneous co-training, semantic subtask/object prediction, 논문 수준의 평가 코드 |
 
 따라서 이 저장소를 읽을 때는 이렇게 보면 좋습니다.
 
-- ACT는 "작은 imitation learning baseline"으로 사용할 수 있습니다.
+- ACT는 이 저장소에서 가장 먼저 실험할 주력 imitation learning policy입니다.
 - pi0.5는 "논문 구조를 따라가며 배우는 뼈대"에 가깝습니다.
-- 논문과 같은 성능을 내려면 빠진 항목을 추가해야 합니다.
+- 논문과 같은 성능을 내려면 데이터 규모, robot calibration, LeRobot processor/Hub workflow, 평가 환경까지 맞춰야 합니다.
 
 ## 설치
 
@@ -93,6 +93,20 @@ GPU가 있다면 다음처럼 실행할 수 있습니다.
 python train.py --mode act --data-dir ./data/demo --device cuda
 ```
 
+ACT는 기본적으로 `chunk_size=100`, `n_action_steps=100`, CVAE/KL 학습을 사용합니다. 작은 GPU나 빠른 구조 확인이 필요하면 다음처럼 줄일 수 있습니다.
+
+```bash
+python train.py --mode act --data-dir ./data/demo --device cpu \
+  --epochs 2 --batch-size 2 --chunk-size 16 --n-action-steps 4
+```
+
+temporal ensemble을 켜려면 매 step마다 policy를 호출해야 하므로 `--n-action-steps 1`을 같이 사용합니다.
+
+```bash
+python train.py --mode act --data-dir ./data/demo --device cuda \
+  --n-action-steps 1 --temporal-ensemble-coeff 0.01
+```
+
 pi0.5는 훨씬 무겁습니다.
 
 ```bash
@@ -136,15 +150,15 @@ collect_data.py
 train.py
     Dataset을 읽음
     collate_fn이 batch를 만듦
-    policy.forward(...) 실행
-    loss 계산
+    ACT는 policy.forward(...)에서 action chunk와 VAE latent를 계산
+    ACT loss는 masked L1 reconstruction + KL loss
     checkpoint 저장
 
 inference.py
     checkpoint 로드
     카메라 이미지와 state를 읽음
     policy.predict_action(...) 실행
-    첫 번째 action을 로봇에 전달
+    action queue 또는 temporal ensemble으로 한 step action을 로봇에 전달
 ```
 
 ## policy forward에서 전달되는 정보
@@ -155,12 +169,28 @@ ACT의 forward는 세 가지를 받습니다.
 actions = policy(images, language_ids, state)
 ```
 
+학습 중에는 정답 action chunk와 padding mask도 함께 전달해서 CVAE latent와 KL loss를 계산합니다.
+
+```python
+loss, metrics = policy.compute_loss(
+    images,
+    language_ids,
+    state,
+    ground_truth_actions,
+    action_mask,
+)
+```
+
 | 입력 | 모양 | 의미 |
 |---|---|---|
 | `images` | `(B, num_cameras, 3, H, W)` | 여러 카메라가 본 현재 장면 |
 | `language_ids` | `(B, text_len)` | 명령 문장을 숫자로 바꾼 토큰 |
 | `state` | `(B, state_dim)` | 현재 로봇 관절 상태 |
+| `actions` | `(B, chunk_size, action_dim)` | 학습 때 쓰는 정답 미래 행동 |
+| `action_mask` | `(B, chunk_size)` | `True`면 padding이라 loss에서 무시 |
 | 반환값 | `(B, chunk_size, action_dim)` | 앞으로 `chunk_size`개 순간의 행동 |
+
+ACT 내부에서는 여러 카메라 이미지를 ResNet spatial token으로 바꾸고, language token, state token, latent token과 함께 Transformer encoder에 넣습니다. decoder는 `chunk_size`개의 learnable action query를 사용해 미래 행동 chunk를 예측합니다.
 
 pi0.5의 학습 loss는 네 가지 정보를 사용합니다.
 
@@ -192,6 +222,9 @@ loss = policy.compute_flow_matching_loss(images, language_ids, ground_truth_acti
 | pi0.5 attention | forward마다 새 attention layer 생성 | 등록된 module로 변경 |
 | pi0.5 sampling | flow sampler가 `forward`를 velocity 함수처럼 호출 | `_predict_velocity` 경로 추가 |
 | robot collection | 매 프레임마다 `input()`이 걸려 녹화가 멈춤 | `Ctrl+C`로 종료하는 루프로 변경 |
+| ACT 구조 | global pooled image feature와 단순 MSE loss만 사용 | spatial image tokens, CVAE latent, KL loss, masked L1 loss 추가 |
+| ACT 추론 | 항상 chunk 첫 action만 사용 | `n_action_steps` action queue와 optional temporal ensemble 추가 |
+| stats 적용 | 계산한 dataset stats가 dataset normalization에 일관되게 반영되지 않음 | `DatasetConfig`에 action/state stats를 주입 |
 
 ## 자주 나는 문제
 
