@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 import os
 import random
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -156,21 +157,19 @@ class ResNetImageEncoder(nn.Module):
             nn.Conv2d(in_planes, hidden_dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Flatten(1),
         )
 
         # Optional dropout after pooling
         self.dropout = nn.Dropout(drop_rate)
 
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        """Encode a batch of multi-camera images.
+    def forward_tokens(self, images: torch.Tensor) -> torch.Tensor:
+        """Encode multi-camera images as spatial tokens.
 
         Args:
             images: Tensor of shape (B, num_cameras, C, H, W).
 
         Returns:
-            Encoded features of shape (B, hidden_dim * num_cameras) after
-            concatenation across camera views.
+            Encoded features of shape (B, num_cameras * h * w, hidden_dim).
         """
         b, n_cam = images.shape[:2]
 
@@ -180,18 +179,37 @@ class ResNetImageEncoder(nn.Module):
         # Backbone -> (B*N, in_planes, h, w)
         feats = self.backbone(images_flat)
 
-        # Pool -> (B*N, in_planes, 1, 1)
-        feats = self.pool(feats)
-
-        # Project & flatten -> (B*N, hidden_dim)
+        # Project -> (B*N, hidden_dim, h, w)
         feats = self.projection(feats)
-
-        # Dropout
         feats = self.dropout(feats)
+        _, d, h, w = feats.shape
 
-        # Reshape back to (B, N*hidden_dim)
+        # Reshape back to camera-aware spatial tokens.
+        feats = feats.view(b, n_cam, d, h, w)
+        feats = feats.permute(0, 1, 3, 4, 2).reshape(b, n_cam * h * w, d)
+        return feats
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """Encode a batch of multi-camera images as pooled camera vectors."""
+        b, n_cam = images.shape[:2]
+        images_flat = images.view(-1, *images.shape[2:])
+        feats = self.backbone(images_flat)
+        feats = self.pool(feats)
+        feats = self.projection(feats)
+        feats = feats.flatten(1)
+        feats = self.dropout(feats)
         feats = feats.view(b, n_cam * self.hidden_dim)
         return feats
+
+def _sinusoidal_1d(num_positions: int, dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    position = torch.arange(num_positions, device=device, dtype=dtype).unsqueeze(1)
+    div_term = torch.exp(
+        torch.arange(0, dim, 2, device=device, dtype=dtype) * (-math.log(10000.0) / dim)
+    )
+    pe = torch.zeros(num_positions, dim, device=device, dtype=dtype)
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    return pe
 
 
 # ============================================================================
@@ -306,14 +324,21 @@ class ACTConfig:
         num_cameras: Number of camera views (default 3).
         image_size: Input image size for each camera (H, W), default (224, 224).
         backbone: ResNet variant, "resnet18" or "resnet50" (default "resnet18").
-        hidden_dim: Model hidden dimension (default 256).
-        action_chunk_size: Number of future actions to predict per step (default 32).
+        hidden_dim: Model hidden dimension (default 512).
+        action_chunk_size: Number of future actions to predict per step (default 100).
+        n_action_steps: Number of queued actions to execute per model call.
         action_dim: Number of action dimensions (robot joint positions, default 14 for ALOHA/SO-101).
-        num_decoder_layers: Number of Transformer decoder layers (default 4).
+        num_encoder_layers: Number of Transformer encoder layers (default 4).
+        num_decoder_layers: Number of Transformer decoder layers (default 1).
         num_decoder_heads: Number of attention heads in decoder (default 8).
         num_layers_lang: Number of Transformer encoder layers for language (default 2).
         vocab_size: Tokenizer vocabulary size (default 128).
         state_dim: Dimension of robot state input (default 28).
+        use_vae: Whether to train with the ACT CVAE latent objective.
+        latent_dim: CVAE latent width.
+        num_vae_encoder_layers: Number of VAE encoder layers.
+        kl_weight: KL divergence loss weight.
+        temporal_ensemble_coeff: Optional exponential temporal ensemble coefficient.
         dropout: Dropout rate for all layers (default 0.1).
         max_instr_len: Maximum instruction length (default 128).
         clip_norm: Gradient clipping norm (default 1.0).
@@ -328,15 +353,22 @@ class ACTConfig:
     num_cameras: int = 3
     image_size: Tuple[int, int] = (224, 224)
     backbone: str = "resnet18"
-    pretrained_backbone: bool = False
-    hidden_dim: int = 256
-    action_chunk_size: int = 32
+    pretrained_backbone: bool = True
+    hidden_dim: int = 512
+    action_chunk_size: int = 100
+    n_action_steps: int = 100
     action_dim: int = 14
-    num_decoder_layers: int = 4
+    num_encoder_layers: int = 4
+    num_decoder_layers: int = 1
     num_decoder_heads: int = 8
     num_layers_lang: int = 2
     vocab_size: int = 128
     state_dim: int = 28
+    use_vae: bool = True
+    latent_dim: int = 32
+    num_vae_encoder_layers: int = 4
+    kl_weight: float = 10.0
+    temporal_ensemble_coeff: Optional[float] = None
     dropout: float = 0.1
     max_instr_len: int = 128
     clip_norm: float = 1.0
@@ -351,6 +383,9 @@ class ACTConfig:
     def from_dict(cls, values: Dict[str, Any]) -> "ACTConfig":
         """Create config from a dict, ignoring unknown keys for robustness."""
         allowed = cls.__dataclass_fields__.keys()
+        if isinstance(values.get("image_size"), list):
+            values = dict(values)
+            values["image_size"] = tuple(values["image_size"])
         return cls(**{k: v for k, v in values.items() if k in allowed})
 
 
@@ -362,14 +397,13 @@ class ACTPolicy(nn.Module):
       - language instruction (B, seq_len) token ids
       - robot state (B, state_dim)
 
-    The architecture follows arXiv:2304.13705 Sec. 3.1-3.3:
-      1. Encode each camera view with a shared ResNet -> visual features.
+    The architecture follows the ACT/LeRobot shape:
+      1. Encode each camera view with a shared ResNet -> spatial feature tokens.
       2. Encode the language instruction with a Transformer encoder.
-      3. Concatenate visual + language features and project to hidden_dim.
-      4. Use this as the initial hidden state for a Transformer decoder whose
-         inputs are learnable "action tokens" (one per chunk position).
-      5. Inject robot state via FiLM-style modulation at each decoder layer.
-      6. Project decoder outputs to action dimensions.
+      3. Encode state, language, image tokens, and an ACT latent token.
+      4. During training, infer the latent from state + target action chunk.
+      5. Decode learnable action queries against the encoded context.
+      6. Train with masked L1 reconstruction plus optional KL divergence.
     """
 
     def __init__(self, config: Optional[ACTConfig] = None) -> None:
@@ -399,33 +433,41 @@ class ACTPolicy(nn.Module):
             max_seq_len=config.max_instr_len,
         )
 
-        # ---- Feature projection (visual + lang -> hidden_dim) ------
-        # Visual features: (B, num_cameras * hidden_dim)
-        # Language features: (B, hidden_dim)
-        # Concatenated: (B, (num_cameras+1) * hidden_dim) -> hidden_dim
-        visual_dim = config.num_cameras * config.hidden_dim
-        self.feat_proj = nn.Sequential(
-            nn.Linear(visual_dim + config.hidden_dim, config.hidden_dim),
-            nn.LayerNorm(config.hidden_dim),
-            nn.GELU(),
-        )
+        # ---- Conditional tokens for the ACT transformer ------
+        self.state_proj = nn.Linear(config.state_dim, config.hidden_dim)
+        self.latent_proj = nn.Linear(config.latent_dim, config.hidden_dim)
+        self.lang_type_embed = nn.Parameter(torch.zeros(1, 1, config.hidden_dim))
+        self.state_type_embed = nn.Parameter(torch.zeros(1, 1, config.hidden_dim))
+        self.latent_type_embed = nn.Parameter(torch.zeros(1, 1, config.hidden_dim))
+        self.camera_embed = nn.Embedding(config.num_cameras, config.hidden_dim)
 
-        # ---- Action token initialization ------
-        # Learnable "action tokens" serve as the decoder input (one per chunk
-        # position). They are analogous to the object query in DETR.
-        self.action_tokens = nn.Parameter(
-            torch.zeros(1, config.action_chunk_size, config.hidden_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.hidden_dim,
+            nhead=config.num_decoder_heads,
+            dim_feedforward=config.hidden_dim * 4,
+            dropout=config.dropout,
+            batch_first=True,
+            activation="gelu",
         )
-        nn.init.normal_(self.action_tokens, std=0.02)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=config.num_encoder_layers)
 
-        # ---- State injection via FiLM modulation ------
-        # The robot state is projected to (gamma, beta) per decoder layer.
-        self.state_film_proj = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(config.state_dim, config.hidden_dim * 2),
+        # ---- VAE encoder used only during training ------
+        if config.use_vae:
+            self.vae_cls = nn.Parameter(torch.zeros(1, 1, config.hidden_dim))
+            self.vae_state_proj = nn.Linear(config.state_dim, config.hidden_dim)
+            self.vae_action_proj = nn.Linear(config.action_dim, config.hidden_dim)
+            vae_layer = nn.TransformerEncoderLayer(
+                d_model=config.hidden_dim,
+                nhead=config.num_decoder_heads,
+                dim_feedforward=config.hidden_dim * 4,
+                dropout=config.dropout,
+                batch_first=True,
+                activation="gelu",
             )
-            for _ in range(config.num_decoder_layers)
-        ])
+            self.vae_encoder = nn.TransformerEncoder(
+                vae_layer, num_layers=config.num_vae_encoder_layers
+            )
+            self.vae_latent_head = nn.Linear(config.hidden_dim, config.latent_dim * 2)
 
         # ---- Transformer decoder ------
         decoder_layer = nn.TransformerDecoderLayer(
@@ -438,36 +480,26 @@ class ACTPolicy(nn.Module):
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=config.num_decoder_layers)
 
         # ---- Action prediction head ------
-        self.action_head = nn.Sequential(
-            nn.Linear(config.hidden_dim, config.hidden_dim // 2),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.hidden_dim // 2, config.action_dim),
-        )
+        self.action_head = nn.Linear(config.hidden_dim, config.action_dim)
 
-        # ---- Position embedding for action tokens ------
-        # The decoder already uses positional encoding internally, but since our
-        # "queries" are learnable tokens, we add a small positional bias for each
-        # chunk position to give the model an absolute-time signal.
-        self.chunk_pos_embed = nn.Parameter(
-            torch.zeros(1, config.action_chunk_size, config.hidden_dim)
-        )
-        nn.init.normal_(self.chunk_pos_embed, std=0.01)
+        # ---- Learnable decoder queries, DETR-style ------
+        self.action_query = nn.Embedding(config.action_chunk_size, config.hidden_dim)
 
         self._init_weights()
+        self.reset()
 
     def _init_weights(self) -> None:
-        """Xavier-initialize the action head and FiLM layers."""
-        for module in self.action_head:
+        """Xavier-initialize projection and transformer parameters."""
+        for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-        for film in self.state_film_proj:
-            for sub in film:
-                if isinstance(sub, nn.Linear):
-                    nn.init.xavier_uniform_(sub.weight)
-                    nn.init.zeros_(sub.bias)
+        nn.init.normal_(self.lang_type_embed, std=0.02)
+        nn.init.normal_(self.state_type_embed, std=0.02)
+        nn.init.normal_(self.latent_type_embed, std=0.02)
+        if hasattr(self, "vae_cls"):
+            nn.init.normal_(self.vae_cls, std=0.02)
 
     # ------------------------------------------------------------------
     # Forward pass
@@ -478,8 +510,10 @@ class ACTPolicy(nn.Module):
         images: torch.Tensor,          # (B, num_cameras, C, H, W)
         token_ids: torch.Tensor,       # (B, seq_len)
         state: torch.Tensor,           # (B, state_dim)
+        actions: Optional[torch.Tensor] = None,
+        action_mask: Optional[torch.Tensor] = None,
         return_features: bool = False, # If True, also return intermediate features
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Full forward pass of the ACT policy.
 
         Args:
@@ -493,91 +527,178 @@ class ACTPolicy(nn.Module):
         """
         b = images.shape[0]
 
-        # 1. Image encoding -> (B, hidden_dim * num_cameras)
-        visual_feats = self.image_encoder(images)  # (B, num_cameras*hidden_dim)
+        # 1. Image encoding -> spatial tokens (B, num_cameras*h*w, hidden_dim)
+        image_tokens = self.image_encoder.forward_tokens(images)
+        image_tokens = image_tokens + self._image_pos_embed(image_tokens, images.shape[1])
 
-        # 2. Language encoding -> (B, hidden_dim)
-        lang_feats = self.lang_encoder(token_ids)  # (B, hidden_dim)
+        # 2. Language and state tokens.
+        lang_feats = self.lang_encoder(token_ids).unsqueeze(1) + self.lang_type_embed
+        state_feats = self.state_proj(state).unsqueeze(1) + self.state_type_embed
 
-        # 3. Concatenate and project -> (B, hidden_dim)
-        fused = torch.cat([visual_feats, lang_feats], dim=1)  # (B, (N+1)*hidden_dim)
-        fused = self.feat_proj(fused)  # (B, hidden_dim)
+        latent, mu, logvar = self._encode_latent(state, actions, action_mask)
+        latent_feats = self.latent_proj(latent).unsqueeze(1) + self.latent_type_embed
 
-        # 4. Expand action tokens to batch and add positional bias
-        tokens = self.action_tokens.expand(b, -1, -1) + self.chunk_pos_embed.expand(b, -1, -1)
+        encoder_input = torch.cat([latent_feats, state_feats, lang_feats, image_tokens], dim=1)
+        memory = self.encoder(encoder_input)
 
-        # 5. FiLM modulation parameters per decoder layer
-        film_params: List[Tuple[torch.Tensor, torch.Tensor]] = []
-        for layer_idx in range(self.config.num_decoder_layers):
-            gamma_beta = self.state_film_proj[layer_idx](state)  # (B, hidden_dim*2)
-            gamma = gamma_beta[:, :self.config.hidden_dim]        # (B, hidden_dim)
-            beta = gamma_beta[:, self.config.hidden_dim:]          # (B, hidden_dim)
-            film_params.append((gamma, beta))
+        # 3. Decode fixed action queries against encoded observation/context tokens.
+        query = self.action_query.weight.unsqueeze(0).expand(b, -1, -1)
+        output = self.decoder(query, memory)
+        action_chunk = self.action_head(output)
 
-        # 6. Transformer decoder with FiLM modulation
-        output = self._forward_with_film(tokens, fused, film_params)  # (B, chunk, hidden_dim)
-
-        # 7. Project to action space
-        action_chunk = self.action_head(output)  # (B, chunk, action_dim)
+        aux: Dict[str, torch.Tensor] = {}
+        if mu is not None and logvar is not None:
+            aux = {"mu": mu, "logvar": logvar}
 
         if return_features:
-            return action_chunk, {
-                "visual_feats": visual_feats,
-                "lang_feats": lang_feats,
-                "fused_feats": fused,
-            }
+            aux.update({
+                "image_tokens": image_tokens,
+                "lang_feats": lang_feats.squeeze(1),
+                "state_feats": state_feats.squeeze(1),
+                "memory": memory,
+            })
+            return action_chunk, aux
         return action_chunk
 
-    def _forward_with_film(
+    def _encode_latent(
         self,
-        tgt: torch.Tensor,
-        memory: torch.Tensor,
-        film_params: List[Tuple[torch.Tensor, torch.Tensor]],
+        state: torch.Tensor,
+        actions: Optional[torch.Tensor],
+        action_mask: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        b = state.shape[0]
+        if not (self.config.use_vae and self.training and actions is not None):
+            latent = torch.zeros(
+                b, self.config.latent_dim, dtype=state.dtype, device=state.device
+            )
+            return latent, None, None
+
+        cls = self.vae_cls.expand(b, -1, -1)
+        state_tok = self.vae_state_proj(state).unsqueeze(1)
+        action_tok = self.vae_action_proj(actions)
+        vae_input = torch.cat([cls, state_tok, action_tok], dim=1)
+
+        pos = _sinusoidal_1d(vae_input.shape[1], self.config.hidden_dim, vae_input.device, vae_input.dtype)
+        vae_input = vae_input + pos.unsqueeze(0)
+
+        key_padding_mask = None
+        if action_mask is not None:
+            prefix = torch.zeros(b, 2, dtype=torch.bool, device=action_mask.device)
+            key_padding_mask = torch.cat([prefix, action_mask.bool()], dim=1)
+
+        cls_out = self.vae_encoder(vae_input, src_key_padding_mask=key_padding_mask)[:, 0]
+        params = self.vae_latent_head(cls_out)
+        mu, logvar = params.chunk(2, dim=-1)
+        std = torch.exp(0.5 * logvar)
+        latent = mu + std * torch.randn_like(std)
+        return latent, mu, logvar
+
+    def _image_pos_embed(self, image_tokens: torch.Tensor, num_cameras: int) -> torch.Tensor:
+        """Create camera-aware 1D spatial position embeddings for image tokens."""
+        b, seq, d = image_tokens.shape
+        tokens_per_camera = max(seq // max(num_cameras, 1), 1)
+        spatial = _sinusoidal_1d(tokens_per_camera, d, image_tokens.device, image_tokens.dtype)
+        spatial = spatial.unsqueeze(0).repeat(num_cameras, 1, 1)
+        cam_ids = torch.arange(num_cameras, device=image_tokens.device)
+        cam = self.camera_embed(cam_ids).to(dtype=image_tokens.dtype).unsqueeze(1)
+        pos = (spatial + cam).reshape(1, num_cameras * tokens_per_camera, d)
+        return pos[:, :seq, :]
+
+    def compute_loss(
+        self,
+        images: torch.Tensor,
+        token_ids: torch.Tensor,
+        state: torch.Tensor,
+        actions: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        pred, aux = self.forward(
+            images,
+            token_ids,
+            state,
+            actions=actions,
+            action_mask=action_mask,
+            return_features=True,
+        )
+        valid_mask = torch.ones_like(actions[..., :1], dtype=pred.dtype)
+        if action_mask is not None:
+            valid_mask = (~action_mask).unsqueeze(-1).to(pred.dtype)
+
+        l1 = (torch.abs(pred - actions) * valid_mask).sum()
+        denom = (valid_mask.sum() * pred.shape[-1]).clamp(min=1.0)
+        l1 = l1 / denom
+
+        loss = l1
+        metrics = {"l1_loss": float(l1.detach().cpu())}
+        if self.config.use_vae and "mu" in aux and "logvar" in aux:
+            mu, logvar = aux["mu"], aux["logvar"]
+            kld = (-0.5 * (1 + logvar - mu.pow(2) - logvar.exp())).sum(-1).mean()
+            loss = loss + self.config.kl_weight * kld
+            metrics["kld_loss"] = float(kld.detach().cpu())
+        metrics["loss"] = float(loss.detach().cpu())
+        return loss, metrics
+
+    def reset(self) -> None:
+        """Reset rollout state between episodes."""
+        self._action_queue: deque[torch.Tensor] = deque(maxlen=max(self.config.n_action_steps, 1))
+        self._ensembled_actions: Optional[torch.Tensor] = None
+        self._ensembled_count: Optional[torch.Tensor] = None
+
+    def select_action(
+        self,
+        images: torch.Tensor,
+        token_ids: torch.Tensor,
+        state: torch.Tensor,
     ) -> torch.Tensor:
-        """Run the decoder with FiLM modulation applied before each layer.
+        """Select one executable action using queueing or temporal ensemble."""
+        self.eval()
+        if self.config.temporal_ensemble_coeff is not None:
+            chunk = self._predict_chunk_batched(images, token_ids, state)
+            return self._temporal_ensemble_update(chunk)
 
-        Args:
-            tgt: Action tokens of shape (B, chunk_size, hidden_dim).
-            memory: Fused visual+lang features of shape (B, hidden_dim) or
-                (B, 1, hidden_dim). Expanded internally if needed.
-            film_params: List of (gamma, beta) per decoder layer.
+        if not self._action_queue:
+            chunk = self._predict_chunk_batched(images, token_ids, state)
+            steps = min(self.config.n_action_steps, self.config.action_chunk_size)
+            for action in chunk[:, :steps].transpose(0, 1):
+                self._action_queue.append(action)
+        return self._action_queue.popleft()
 
-        Returns:
-            Decoder output of shape (B, chunk_size, hidden_dim).
-        """
-        # Expand memory to (B, 1, hidden_dim) if needed
-        if memory.ndim == 2:
-            memory = memory.unsqueeze(1)
+    def _predict_chunk_batched(
+        self,
+        images: torch.Tensor,
+        token_ids: torch.Tensor,
+        state: torch.Tensor,
+    ) -> torch.Tensor:
+        if images.ndim == 4:
+            images = images.unsqueeze(0)
+        if token_ids.ndim == 1:
+            token_ids = token_ids.unsqueeze(0)
+        if state.ndim == 1:
+            state = state.unsqueeze(0)
+        return self.forward(images, token_ids, state)
 
-        output = tgt
-        for layer_idx in range(len(self.decoder.layers)):
-            layer = self.decoder.layers[layer_idx]
-            gamma, beta = film_params[layer_idx]
-
-            # FiLM on target (applied to the current layer input)
-            tgt_film = output * (1 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
-
-            # Multi-head self-attention on target
-            attn_out = layer.self_attn(tgt_film, tgt_film, tgt_film)[0]
-            output = output + F.dropout(attn_out, p=self.config.dropout, training=self.training)
-            output = layer.norm1(output)
-
-            # FiLM on memory (computed fresh each iteration with the same gamma/beta)
-            mem_film = memory * (1 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
-
-            # Cross-attention with FiLM-modulated memory
-            cross_attn = layer.cross_attn(query=output, key=mem_film, value=mem_film)[0]
-            output = output + F.dropout(cross_attn, p=self.config.dropout, training=self.training)
-            output = layer.norm2(output)
-
-            # Feed-forward
-            ff = layer.linear2(F.gelu(F.dropout(
-                layer.linear1(output), p=self.config.dropout, training=self.training
-            )))
-            output = output + F.dropout(ff, p=self.config.dropout, training=self.training)
-            output = layer.norm3(output)
-
-        return output
+    def _temporal_ensemble_update(self, actions: torch.Tensor) -> torch.Tensor:
+        coeff = float(self.config.temporal_ensemble_coeff or 0.0)
+        chunk = actions.shape[1]
+        weights = torch.exp(-coeff * torch.arange(chunk, device=actions.device, dtype=actions.dtype))
+        cumsum = torch.cumsum(weights, dim=0)
+        if self._ensembled_actions is None:
+            self._ensembled_actions = actions.clone()
+            self._ensembled_count = torch.ones((chunk, 1), dtype=torch.long, device=actions.device)
+        else:
+            count = self._ensembled_count
+            prev = self._ensembled_actions
+            prev *= cumsum[count - 1].view(1, -1, 1)
+            next_count = torch.clamp(count, max=chunk - 1)
+            prev += actions[:, :-1] * weights[next_count].view(1, -1, 1)
+            prev /= cumsum[next_count].view(1, -1, 1)
+            count = torch.clamp(count + 1, max=chunk)
+            self._ensembled_actions = torch.cat([prev, actions[:, -1:]], dim=1)
+            self._ensembled_count = torch.cat([count, torch.ones_like(count[-1:])])
+        action = self._ensembled_actions[:, 0]
+        self._ensembled_actions = self._ensembled_actions[:, 1:]
+        self._ensembled_count = self._ensembled_count[1:]
+        return action
 
     # ------------------------------------------------------------------
     # Inference
@@ -590,10 +711,11 @@ class ACTPolicy(nn.Module):
         token_ids: torch.Tensor,
         state: torch.Tensor,
     ) -> torch.Tensor:
-        """Inference: return the **first** action in the predicted chunk.
+        """Inference: return one executable action.
 
-        In ALOHA, the robot executes only the first action of the chunk and
-        replans at the next timestep (rolling horizon).
+        By default this uses an ACT-style action queue and only queries the
+        network when the queue is empty. If temporal ensembling is enabled, the
+        policy instead queries every step and returns the ensembled action.
 
         Args:
             images: (B, num_cameras, C, H, W) or (num_cameras, C, H, W).
@@ -615,8 +737,7 @@ class ACTPolicy(nn.Module):
             state = state.unsqueeze(0)
             singleton = True
 
-        chunk = self.forward(images, token_ids, state)  # (B, chunk, dim)
-        action = chunk[:, 0, :]  # (B, dim) -- first action of the chunk
+        action = self.select_action(images, token_ids, state)
 
         if singleton:
             action = action.squeeze(0)  # back to (dim,) for single sample
@@ -667,10 +788,10 @@ class ACTPolicy(nn.Module):
 # ============================================================================
 
 class ACTLoss(nn.Module):
-    """Loss function for the ACT policy.
+    """Masked L1 reconstruction loss for ACT action chunks.
 
-    Uses MSE loss between the predicted action chunk and the ground-truth
-    action chunk. Supports sample-level masking for variable-length sequences.
+    LeRobot and the original ACT implementation train the action decoder with
+    L1 reconstruction, optionally adding a KL term when using the VAE path.
 
     Args:
         reduction: "mean" or "sum" -- how to aggregate the loss.
@@ -679,7 +800,7 @@ class ACTLoss(nn.Module):
     def __init__(self, reduction: str = "mean") -> None:
         super().__init__()
         self.reduction = reduction
-        self.mse_loss = nn.MSELoss(reduction=reduction)
+        self.l1_loss = nn.L1Loss(reduction=reduction)
 
     def forward(
         self,
@@ -687,7 +808,7 @@ class ACTLoss(nn.Module):
         gt_chunk: torch.Tensor,    # (B, chunk_size, action_dim)
         mask: Optional[torch.Tensor] = None,  # (B, chunk_size), True=ignore
     ) -> torch.Tensor:
-        """Compute the MSE loss.
+        """Compute masked L1 loss.
 
         Args:
             pred_chunk: Predicted action chunk.
@@ -699,14 +820,14 @@ class ACTLoss(nn.Module):
             Scalar loss tensor.
         """
         if mask is None:
-            return self.mse_loss(pred_chunk, gt_chunk)
+            return self.l1_loss(pred_chunk, gt_chunk)
 
         valid_mask = (~mask).unsqueeze(-1).to(pred_chunk.dtype)
-        squared_error = (pred_chunk - gt_chunk).pow(2) * valid_mask
+        abs_error = torch.abs(pred_chunk - gt_chunk) * valid_mask
         if self.reduction == "sum":
-            return squared_error.sum()
+            return abs_error.sum()
         denom = valid_mask.sum().clamp(min=1.0) * pred_chunk.shape[-1]
-        return squared_error.sum() / denom
+        return abs_error.sum() / denom
 
 
 # ============================================================================

@@ -66,8 +66,16 @@ def validate_config(config: Any, mode: str = "act") -> None:
         assert isinstance(config, ACTConfig), f"Expected ACTConfig, got {type(config).__name__}"
         if config.action_chunk_size <= 0:
             raise ValueError("action_chunk_size must be > 0")
+        if getattr(config, "n_action_steps", 1) <= 0:
+            raise ValueError("n_action_steps must be > 0")
+        if getattr(config, "n_action_steps", 1) > config.action_chunk_size:
+            raise ValueError("n_action_steps must be <= action_chunk_size")
         if config.action_dim <= 0:
             raise ValueError("action_dim must be > 0")
+        if getattr(config, "use_vae", False) and getattr(config, "kl_weight", 0.0) < 0:
+            raise ValueError("kl_weight must be >= 0")
+        if getattr(config, "temporal_ensemble_coeff", None) is not None and getattr(config, "n_action_steps", 1) > 1:
+            raise ValueError("temporal_ensemble_coeff requires n_action_steps == 1")
         if config.num_epochs <= 0:
             raise ValueError("num_epochs must be > 0")
         if config.batch_size <= 0:

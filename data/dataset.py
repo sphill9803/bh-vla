@@ -68,6 +68,10 @@ class DatasetConfig:
     action_dim: int = 14
     state_dim: int = 28
     mode: str = "act"
+    action_mean: Optional[List[float]] = None
+    action_std: Optional[List[float]] = None
+    state_mean: Optional[List[float]] = None
+    state_std: Optional[List[float]] = None
     train_split: float = 0.8
     val_split: float = 0.1
     test_split: float = 0.1
@@ -237,6 +241,43 @@ def _normalise_image_tensor(images: torch.Tensor, mode: str) -> torch.Tensor:
     return (images - mean) / std
 
 
+def _stats_array(values: Optional[List[float]], fallback: np.ndarray) -> np.ndarray:
+    if values is None:
+        return fallback.astype(np.float32)
+    return np.asarray(values, dtype=np.float32)
+
+
+def _match_last_dim(values: np.ndarray, target_dim: int, fill: float) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    if values.size >= target_dim:
+        return values[:target_dim]
+    out = np.full(target_dim, fill, dtype=np.float32)
+    out[: values.size] = values
+    return out
+
+
+def _normalize_actions_with_config(actions: np.ndarray, config: DatasetConfig) -> np.ndarray:
+    arr = np.asarray(actions, dtype=np.float32)
+    if not config.normalize_actions:
+        return arr
+    if config.action_mean is None or config.action_std is None:
+        return arr
+    mean = _match_last_dim(_stats_array(config.action_mean, np.zeros(arr.shape[-1], dtype=np.float32)), arr.shape[-1], 0.0)
+    std = _match_last_dim(_stats_array(config.action_std, np.ones(arr.shape[-1], dtype=np.float32)), arr.shape[-1], 1.0)
+    return (arr - mean) / (std + 1e-8)
+
+
+def _normalize_state_with_config(state: np.ndarray, config: DatasetConfig) -> np.ndarray:
+    arr = np.asarray(state, dtype=np.float32)
+    if not config.normalize_observations:
+        return arr
+    if config.state_mean is None or config.state_std is None:
+        return arr
+    mean = _match_last_dim(_stats_array(config.state_mean, np.zeros(arr.shape[-1], dtype=np.float32)), arr.shape[-1], 0.0)
+    std = _match_last_dim(_stats_array(config.state_std, np.ones(arr.shape[-1], dtype=np.float32)), arr.shape[-1], 1.0)
+    return (arr - mean) / (std + 1e-8)
+
+
 def _image_dict_to_tensor(images: Dict[str, Any], num_cameras: int, image_size: int, mode: str) -> torch.Tensor:
     """Convert a camera dict to (num_cameras, 3, H, W)."""
     ordered = list(images.values())
@@ -368,7 +409,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             self.episode_refs = self.episode_refs[: self.config.max_dataset_size]
 
         # Compute normalisation stats if requested
-        if self.config.normalize_actions:
+        if self.config.normalize_actions and self.config.action_mean is None:
             self._compute_action_stats()
 
     def _compute_action_stats(self) -> None:
@@ -457,6 +498,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             mean = self.normalization_stats["action_mean"]
             std = self.normalization_stats["action_std"]
             actions = (actions - mean) / (std + 1e-8)
+        actions = _normalize_actions_with_config(actions, self.config)
 
         action_chunk, action_mask = _slice_action_chunk(
             actions,
@@ -469,7 +511,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
             "images": images,
             "actions": torch.tensor(action_chunk, dtype=torch.float32),
             "action_mask": torch.tensor(action_mask, dtype=torch.bool),
-            "state": torch.tensor(_slice_state(states, t, self.config.state_dim), dtype=torch.float32),
+            "state": torch.tensor(
+                _normalize_state_with_config(_slice_state(states, t, self.config.state_dim), self.config),
+                dtype=torch.float32,
+            ),
             "language": instruction,
         }
 
@@ -537,7 +582,7 @@ class RLDSDataset(torch.utils.data.Dataset):
             raise FileNotFoundError(f"No TFRecord files found in {split_dir}")
 
         # Compute normalisation stats from the first record
-        if self.config.normalize_actions:
+        if self.config.normalize_actions and self.config.action_mean is None:
             try:
                 import tensorflow_datasets as tfds
             except ImportError:
@@ -619,10 +664,22 @@ class RLDSDataset(torch.utils.data.Dataset):
                         mean = self.normalization_stats["action_mean"]
                         std = self.normalization_stats["action_std"]
                         actions = (actions - mean) / (std + 1e-8)
+                    actions = _normalize_actions_with_config(actions, self.config)
+                    state = _normalize_state_with_config(
+                        _pad_or_trim_vector(state, self.config.state_dim),
+                        self.config,
+                    )
+                    action_chunk, action_mask = _slice_action_chunk(
+                        actions,
+                        0,
+                        self.config.action_chunk_size,
+                        self.config.action_dim,
+                    )
 
                     return {
                         "images": images,
-                        "actions": torch.tensor(actions, dtype=torch.float32),
+                        "actions": torch.tensor(action_chunk, dtype=torch.float32),
+                        "action_mask": torch.tensor(action_mask, dtype=torch.bool),
                         "state": torch.tensor(state, dtype=torch.float32),
                         "language": lang,
                     }
@@ -635,8 +692,9 @@ class RLDSDataset(torch.utils.data.Dataset):
         return {
             "images": {k: np.zeros((self.config.image_size, self.config.image_size, 3), dtype=np.uint8)
                        for k in self.config.image_keys},
-            "actions": torch.zeros(1, 14, dtype=torch.float32),
-            "state": torch.zeros(28, dtype=torch.float32),
+            "actions": torch.zeros(self.config.action_chunk_size, self.config.action_dim, dtype=torch.float32),
+            "action_mask": torch.zeros(self.config.action_chunk_size, dtype=torch.bool),
+            "state": torch.zeros(self.config.state_dim, dtype=torch.float32),
             "language": "pick up the object",
         }
 
@@ -700,7 +758,7 @@ class DirectoryDataset(torch.utils.data.Dataset):
         self.episode_dirs = _split_items(episode_dirs, self.config, self.split)
 
         # Compute normalisation stats from the first few episodes
-        if self.config.normalize_actions:
+        if self.config.normalize_actions and self.config.action_mean is None:
             all_actions: List[np.ndarray] = []
             for ep_dir in self.episode_dirs[:10]:  # Sample first 10 episodes
                 actions_path = os.path.join(ep_dir, "actions.npy")
@@ -776,6 +834,7 @@ class DirectoryDataset(torch.utils.data.Dataset):
             mean = self.normalization_stats["action_mean"]
             std = self.normalization_stats["action_std"]
             actions = (actions - mean) / (std + 1e-8)
+        actions = _normalize_actions_with_config(actions, self.config)
 
         action_chunk, action_mask = _slice_action_chunk(
             actions,
@@ -788,7 +847,10 @@ class DirectoryDataset(torch.utils.data.Dataset):
             "images": images,
             "actions": torch.tensor(action_chunk, dtype=torch.float32),
             "action_mask": torch.tensor(action_mask, dtype=torch.bool),
-            "state": torch.tensor(_slice_state(states, t, self.config.state_dim), dtype=torch.float32),
+            "state": torch.tensor(
+                _normalize_state_with_config(_slice_state(states, t, self.config.state_dim), self.config),
+                dtype=torch.float32,
+            ),
             "language": language,
         }
 
@@ -858,7 +920,7 @@ class ALOHADataset(torch.utils.data.Dataset):
         self.episode_dirs = _split_items(episode_dirs, self.config, self.split)
 
         # Compute per-arm normalisation stats
-        if self.config.normalize_actions:
+        if self.config.normalize_actions and self.config.action_mean is None:
             left_actions: List[np.ndarray] = []
             right_actions: List[np.ndarray] = []
             for ep_dir in self.episode_dirs[:10]:
@@ -954,6 +1016,7 @@ class ALOHADataset(torch.utils.data.Dataset):
                 mean = self.normalization_stats.get("action_mean", np.zeros(28))
                 std = self.normalization_stats.get("action_std", np.ones(28) + 1e-8)
                 actions = (actions - mean) / (std + 1e-8)
+        actions = _normalize_actions_with_config(actions, self.config)
 
         action_chunk, action_mask = _slice_action_chunk(
             actions,
@@ -966,7 +1029,10 @@ class ALOHADataset(torch.utils.data.Dataset):
             "images": images,
             "actions": torch.tensor(action_chunk, dtype=torch.float32),
             "action_mask": torch.tensor(action_mask, dtype=torch.bool),
-            "state": torch.tensor(_slice_state(states, t, self.config.state_dim), dtype=torch.float32),
+            "state": torch.tensor(
+                _normalize_state_with_config(_slice_state(states, t, self.config.state_dim), self.config),
+                dtype=torch.float32,
+            ),
             "language": language,
         }
 

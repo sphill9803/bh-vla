@@ -140,6 +140,52 @@ def setup_accelerate(args: argparse.Namespace):
     return accelerator
 
 
+def _square_image_size(value: Any) -> int:
+    """Return a single square image size from an int or (H, W) config value."""
+    if isinstance(value, (tuple, list)):
+        if len(value) == 0:
+            return 224
+        return int(value[0])
+    return int(value)
+
+
+def _compute_act_loss(
+    model: torch.nn.Module,
+    loss_fn: Any,
+    images: torch.Tensor,
+    language_ids: torch.Tensor,
+    states: torch.Tensor,
+    actions_gt: torch.Tensor,
+    action_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Compute ACT loss through model.forward so DDP/Accelerate hooks stay active."""
+    try:
+        pred, aux = model(
+            images,
+            language_ids,
+            states,
+            actions_gt,
+            action_mask,
+            True,
+        )
+    except TypeError:
+        actions_pred = model(images, language_ids, states)
+        return loss_fn(actions_pred, actions_gt, action_mask)
+
+    valid_mask = torch.ones_like(actions_gt[..., :1], dtype=pred.dtype)
+    if action_mask is not None:
+        valid_mask = (~action_mask).unsqueeze(-1).to(pred.dtype)
+    l1 = (torch.abs(pred - actions_gt) * valid_mask).sum()
+    loss = l1 / (valid_mask.sum().clamp(min=1.0) * pred.shape[-1])
+
+    config = getattr(getattr(model, "module", model), "config", None)
+    if config is not None and getattr(config, "use_vae", False) and "mu" in aux and "logvar" in aux:
+        mu, logvar = aux["mu"], aux["logvar"]
+        kld = (-0.5 * (1 + logvar - mu.pow(2) - logvar.exp())).sum(-1).mean()
+        loss = loss + getattr(config, "kl_weight", 10.0) * kld
+    return loss
+
+
 # =====================================================================
 # Training State
 # =====================================================================
@@ -213,8 +259,7 @@ def train_one_epoch(
         if accelerator is not None:
             # accelerator.prepare() handles AMP, DDP, etc. automatically
             if mode == "act":
-                actions_pred = model(images, language_ids, states)
-                loss = loss_fn(actions_pred, actions_gt, action_mask)
+                loss = _compute_act_loss(model, loss_fn, images, language_ids, states, actions_gt, action_mask)
             elif mode == "pi05":
                 loss = model.compute_flow_matching_loss(images, language_ids, actions_gt)
             else:
@@ -231,8 +276,7 @@ def train_one_epoch(
                 from torch.cuda.amp import autocast
                 with autocast():
                     if mode == "act":
-                        actions_pred = model(images, language_ids, states)
-                        loss = loss_fn(actions_pred, actions_gt, action_mask)
+                        loss = _compute_act_loss(model, loss_fn, images, language_ids, states, actions_gt, action_mask)
                     elif mode == "pi05":
                         loss = model.compute_flow_matching_loss(images, language_ids, actions_gt)
                     else:
@@ -246,8 +290,7 @@ def train_one_epoch(
                 scaler.update()
             else:
                 if mode == "act":
-                    actions_pred = model(images, language_ids, states)
-                    loss = loss_fn(actions_pred, actions_gt, action_mask)
+                    loss = _compute_act_loss(model, loss_fn, images, language_ids, states, actions_gt, action_mask)
                 elif mode == "pi05":
                     loss = model.compute_flow_matching_loss(images, language_ids, actions_gt)
                 else:
@@ -296,8 +339,7 @@ def evaluate(
 
             if accelerator is not None:
                 if mode == "act":
-                    actions_pred = model(images, language_ids, states)
-                    loss = ACTLoss()(actions_pred, actions_gt, action_mask)
+                    loss = _compute_act_loss(model, ACTLoss(), images, language_ids, states, actions_gt, action_mask)
                 elif mode == "pi05":
                     loss = model.compute_flow_matching_loss(images, language_ids, actions_gt)
                 else:
@@ -309,8 +351,7 @@ def evaluate(
                     from torch.cuda.amp import autocast
                     with autocast():
                         if mode == "act":
-                            actions_pred = model(images, language_ids, states)
-                            loss = ACTLoss()(actions_pred, actions_gt, action_mask)
+                            loss = _compute_act_loss(model, ACTLoss(), images, language_ids, states, actions_gt, action_mask)
                         elif mode == "pi05":
                             loss = model.compute_flow_matching_loss(images, language_ids, actions_gt)
                         else:
@@ -318,8 +359,7 @@ def evaluate(
                         loss = loss.to(torch.float32)
                 else:
                     if mode == "act":
-                        actions_pred = model(images, language_ids, states)
-                        loss = ACTLoss()(actions_pred, actions_gt, action_mask)
+                        loss = _compute_act_loss(model, ACTLoss(), images, language_ids, states, actions_gt, action_mask)
                     elif mode == "pi05":
                         loss = model.compute_flow_matching_loss(images, language_ids, actions_gt)
                     else:
@@ -365,12 +405,30 @@ def train(args: argparse.Namespace) -> None:
             setattr(config, "batch_size", args.batch_size)
         if args.epochs:
             setattr(config, "num_epochs", args.epochs)
+        if args.gradient_clip and hasattr(config, "gradient_clip"):
+            setattr(config, "gradient_clip", args.gradient_clip)
+        if args.chunk_size and hasattr(config, "action_chunk_size"):
+            setattr(config, "action_chunk_size", args.chunk_size)
+        if (args.n_action_steps or args.temporal_ensemble_coeff is not None) and hasattr(config, "n_action_steps"):
+            setattr(config, "n_action_steps", args.n_action_steps or 1)
+        if args.no_vae and hasattr(config, "use_vae"):
+            setattr(config, "use_vae", False)
+        if args.kl_weight is not None and hasattr(config, "kl_weight"):
+            setattr(config, "kl_weight", args.kl_weight)
+        if args.temporal_ensemble_coeff is not None and hasattr(config, "temporal_ensemble_coeff"):
+            setattr(config, "temporal_ensemble_coeff", args.temporal_ensemble_coeff)
     else:
         if args.mode == "act":
             config = ACTConfig(
                 lr=args.lr or 1e-4,
                 batch_size=args.batch_size or 32,
                 num_epochs=args.epochs or 100,
+                gradient_clip=args.gradient_clip,
+                action_chunk_size=args.chunk_size or 100,
+                n_action_steps=args.n_action_steps or (1 if args.temporal_ensemble_coeff is not None else (args.chunk_size or 100)),
+                use_vae=not args.no_vae,
+                kl_weight=10.0 if args.kl_weight is None else args.kl_weight,
+                temporal_ensemble_coeff=args.temporal_ensemble_coeff,
             )
         else:
             config = Pi05Config(
@@ -391,9 +449,10 @@ def train(args: argparse.Namespace) -> None:
     policy = policy.to(device)
 
     # 4. Dataset loading
+    image_size = _square_image_size(getattr(config, "image_size", 224))
     ds_config = DatasetConfig(
         data_dir=args.data_dir or "./data",
-        image_size=getattr(config, "image_size", 224),
+        image_size=image_size,
         num_cameras=getattr(config, "num_cameras", 3),
         action_chunk_size=getattr(config, "action_chunk_size", 32),
         action_dim=getattr(config, "action_dim", 14),
@@ -406,19 +465,26 @@ def train(args: argparse.Namespace) -> None:
     )
     if args.data_format == "lerobot":
         dataset_cls = LeRobotDataset
+        dataset_kind = "lerobot"
     elif args.data_format == "rlds":
         dataset_cls = RLDSDataset
+        dataset_kind = "rlds"
     elif args.data_format == "directory":
         dataset_cls = DirectoryDataset
+        dataset_kind = "directory"
     elif args.data_format == "aloha":
         dataset_cls = ALOHADataset
+        dataset_kind = "aloha"
     else:
         if os.path.exists(os.path.join(ds_config.data_dir, "dataset_infos.json")):
             dataset_cls = LeRobotDataset
+            dataset_kind = "lerobot"
         elif os.path.exists(os.path.join(ds_config.data_dir, "data.json")):
             dataset_cls = DirectoryDataset
+            dataset_kind = "directory"
         else:
             dataset_cls = ALOHADataset
+            dataset_kind = "aloha"
 
     # Dataset stats
     dataset_stats = None
@@ -430,7 +496,8 @@ def train(args: argparse.Namespace) -> None:
 
     if dataset_stats is None:
         logger.info("Computing dataset statistics...")
-        dataset_stats = compute_dataset_stats(ds_config.data_dir)
+        dataset_kind = dataset_kind if dataset_kind in {"directory", "lerobot", "aloha"} else "directory"
+        dataset_stats = compute_dataset_stats(ds_config.data_dir, dataset_type=dataset_kind)
         ensure_dir(os.path.dirname(stats_path))
         with open(stats_path, "w") as f:
             json.dump(
@@ -438,6 +505,11 @@ def train(args: argparse.Namespace) -> None:
                 f,
                 indent=2,
             )
+    if dataset_stats:
+        ds_config.action_mean = dataset_stats.get("action_mean")
+        ds_config.action_std = dataset_stats.get("action_std")
+        ds_config.state_mean = dataset_stats.get("state_mean")
+        ds_config.state_std = dataset_stats.get("state_std")
 
     # Split dataset by index
     train_ds = dataset_cls(ds_config.data_dir, ds_config, split="train")
@@ -445,7 +517,7 @@ def train(args: argparse.Namespace) -> None:
     batch_collate = partial(
         collate_fn,
         mode=args.mode,
-        image_size=getattr(config, "image_size", 224),
+        image_size=image_size,
         num_cameras=getattr(config, "num_cameras", 3),
         action_chunk_size=getattr(config, "action_chunk_size", 32),
         action_dim=getattr(config, "action_dim", 14),
@@ -729,6 +801,16 @@ Examples:
                         help="Use automatic mixed precision")
     parser.add_argument("--gradient-clip", type=float, default=1.0,
                         help="Gradient clipping norm")
+    parser.add_argument("--chunk-size", type=int, default=None,
+                        help="ACT action chunk size")
+    parser.add_argument("--n-action-steps", type=int, default=None,
+                        help="Number of ACT actions to execute per policy call")
+    parser.add_argument("--no-vae", action="store_true",
+                        help="Disable ACT VAE/KL training objective")
+    parser.add_argument("--kl-weight", type=float, default=None,
+                        help="ACT KL loss weight")
+    parser.add_argument("--temporal-ensemble-coeff", type=float, default=None,
+                        help="Enable ACT temporal ensemble; requires --n-action-steps 1")
 
     # ===== Accelerate options =====
     parser.add_argument("--use-accelerate", action="store_true",
